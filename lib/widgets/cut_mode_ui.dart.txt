@@ -1,0 +1,482 @@
+import 'dart:ui' show ImageFilter;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+// ── Tool enum ──────────────────────────────────────────────────────────────
+enum CutTool { smart, draw, rectangle, circle }
+
+extension CutToolX on CutTool {
+  String get label {
+    switch (this) {
+      case CutTool.smart:
+        return 'Smart';
+      case CutTool.draw:
+        return 'Draw';
+      case CutTool.rectangle:
+        return 'Rect';
+      case CutTool.circle:
+        return 'Circle';
+    }
+  }
+
+  IconData get icon {
+    switch (this) {
+      case CutTool.smart:
+        return Icons.auto_fix_high_rounded;
+      case CutTool.draw:
+        return Icons.edit_rounded;
+      case CutTool.rectangle:
+        return Icons.crop_square_rounded;
+      case CutTool.circle:
+        return Icons.radio_button_unchecked_rounded;
+    }
+  }
+
+  String get instruction {
+    switch (this) {
+      case CutTool.smart:
+        return 'Tap on socket or switch';
+      case CutTool.draw:
+        return 'Draw around area to cut';
+      case CutTool.rectangle:
+        return 'Drag to draw rectangle';
+      case CutTool.circle:
+        return 'Drag to draw circle';
+    }
+  }
+}
+
+// ── Colors ─────────────────────────────────────────────────────────────────
+const _kGold = Color(0xFFFFD369);
+const _kBgDark = Color(0xEB0A0A0A);
+const _kGrey = Color(0xFF888888);
+
+// ══════════════════════════════════════════════════════════════════════════
+// CutModeButton — gold scissors FAB, shown when wallpaper is placed
+// ══════════════════════════════════════════════════════════════════════════
+class CutModeButton extends StatefulWidget {
+  final VoidCallback onPressed;
+  final bool visible;
+
+  const CutModeButton({
+    super.key,
+    required this.onPressed,
+    required this.visible,
+  });
+
+  @override
+  State<CutModeButton> createState() => _CutModeButtonState();
+}
+
+class _CutModeButtonState extends State<CutModeButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  late final Animation<double> _scale;
+  late final Animation<double> _opacity;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 400),
+    );
+    _scale = CurvedAnimation(
+      parent: _ctrl,
+      curve: Curves.elasticOut,
+    );
+    _opacity = CurvedAnimation(
+      parent: _ctrl,
+      curve: Curves.easeIn,
+    );
+  }
+
+  @override
+  void didUpdateWidget(CutModeButton old) {
+    super.didUpdateWidget(old);
+    widget.visible ? _ctrl.forward() : _ctrl.reverse();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned(
+      right: 16,
+      bottom: 120,
+      child: FadeTransition(
+        opacity: _opacity,
+        child: ScaleTransition(
+          scale: _scale,
+          child: GestureDetector(
+            onTap: () {
+              HapticFeedback.mediumImpact();
+              widget.onPressed();
+            },
+            child: Container(
+              width: 56,
+              height: 56,
+              decoration: BoxDecoration(
+                color: _kGold,
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(
+                    color: _kGold.withOpacity(0.4),
+                    blurRadius: 12,
+                    spreadRadius: 0,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: const Icon(
+                Icons.content_cut_rounded,
+                color: Color(0xFF0A0A0A),
+                size: 24,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// CutModeToolbar — top toolbar shown when cut mode is active
+// ══════════════════════════════════════════════════════════════════════════
+class CutModeToolbar extends StatelessWidget {
+  final CutTool activeTool;
+  final int cutCount;
+  final ValueChanged<CutTool> onToolChanged;
+  final VoidCallback onUndo;
+  final VoidCallback onClear;
+  final VoidCallback onDone;
+
+  const CutModeToolbar({
+    super.key,
+    required this.activeTool,
+    required this.cutCount,
+    required this.onToolChanged,
+    required this.onUndo,
+    required this.onClear,
+    required this.onDone,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned(
+      top: 0,
+      left: 0,
+      right: 0,
+      child: SafeArea(
+        bottom: false,
+        child: ClipRect(
+          child: BackdropFilter(
+            filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+            child: Container(
+              height: 56,
+              color: _kBgDark,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Row(
+                children: [
+                  ...CutTool.values.map(
+                    (t) => _ToolBtn(
+                      tool: t,
+                      isActive: activeTool == t,
+                      onTap: () {
+                        HapticFeedback.selectionClick();
+                        onToolChanged(t);
+                      },
+                    ),
+                  ),
+                  _Divider(),
+                  _ActionBtn(
+                    icon: Icons.undo_rounded,
+                    label: 'Undo',
+                    enabled: cutCount > 0,
+                    onTap: onUndo,
+                  ),
+                  _ActionBtn(
+                    icon: Icons.delete_outline_rounded,
+                    label: 'Clear',
+                    enabled: cutCount > 0,
+                    onTap: onClear,
+                  ),
+                  _Divider(),
+                  const Spacer(),
+                  _DoneBtn(onTap: onDone),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// CutModeInstructions — animated gold pill below toolbar
+// ══════════════════════════════════════════════════════════════════════════
+class CutModeInstructions extends StatefulWidget {
+  final CutTool activeTool;
+  final bool visible;
+
+  const CutModeInstructions({
+    super.key,
+    required this.activeTool,
+    required this.visible,
+  });
+
+  @override
+  State<CutModeInstructions> createState() => _CutModeInstructionsState();
+}
+
+class _CutModeInstructionsState extends State<CutModeInstructions>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  late final Animation<double> _fade;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 280),
+    );
+    _fade = CurvedAnimation(
+      parent: _ctrl,
+      curve: Curves.easeInOut,
+    );
+    if (widget.visible) _ctrl.forward();
+  }
+
+  @override
+  void didUpdateWidget(CutModeInstructions old) {
+    super.didUpdateWidget(old);
+    widget.visible ? _ctrl.forward() : _ctrl.reverse();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned(
+      top: MediaQuery.of(context).padding.top + 64,
+      left: 0,
+      right: 0,
+      child: Center(
+        child: FadeTransition(
+          opacity: _fade,
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 200),
+            transitionBuilder: (child, anim) =>
+                FadeTransition(opacity: anim, child: child),
+            child: _Pill(
+              key: ValueKey(widget.activeTool),
+              text: widget.activeTool.instruction,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Pill widget ───────────────────────────────────────────────────────────
+class _Pill extends StatelessWidget {
+  final String text;
+  const _Pill({super.key, required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: 16,
+        vertical: 8,
+      ),
+      decoration: BoxDecoration(
+        color: _kGold,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+            color: _kGold.withOpacity(0.3),
+            blurRadius: 8,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          color: Color(0xFF0A0A0A),
+          fontSize: 13,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+}
+
+// ── Tool button ───────────────────────────────────────────────────────────
+class _ToolBtn extends StatelessWidget {
+  final CutTool tool;
+  final bool isActive;
+  final VoidCallback onTap;
+
+  const _ToolBtn({
+    required this.tool,
+    required this.isActive,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+        width: 54,
+        height: 44,
+        margin: const EdgeInsets.symmetric(horizontal: 1),
+        decoration: BoxDecoration(
+          color: isActive
+              ? _kGold.withOpacity(0.18)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(8),
+          border: isActive
+              ? Border.all(
+                  color: _kGold.withOpacity(0.5),
+                  width: 1,
+                )
+              : null,
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              tool.icon,
+              size: 20,
+              color: isActive ? _kGold : _kGrey,
+            ),
+            const SizedBox(height: 2),
+            Text(
+              tool.label,
+              style: TextStyle(
+                fontSize: 9,
+                color: isActive ? _kGold : _kGrey,
+                fontWeight: isActive
+                    ? FontWeight.w600
+                    : FontWeight.w400,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ── Action button (Undo / Clear) ──────────────────────────────────────────
+class _ActionBtn extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  const _ActionBtn({
+    required this.icon,
+    required this.label,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final color = enabled
+        ? _kGrey
+        : _kGrey.withOpacity(0.3);
+    return GestureDetector(
+      onTap: enabled
+          ? () {
+              HapticFeedback.lightImpact();
+              onTap();
+            }
+          : null,
+      child: SizedBox(
+        width: 48,
+        height: 44,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 20, color: color),
+            const SizedBox(height: 2),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 9,
+                color: color,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ── Done button ───────────────────────────────────────────────────────────
+class _DoneBtn extends StatelessWidget {
+  final VoidCallback onTap;
+  const _DoneBtn({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: () {
+        HapticFeedback.mediumImpact();
+        onTap();
+      },
+      child: Container(
+        height: 32,
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        decoration: BoxDecoration(
+          color: _kGold,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: const Center(
+          child: Text(
+            'Done',
+            style: TextStyle(
+              color: Color(0xFF0A0A0A),
+              fontWeight: FontWeight.w700,
+              fontSize: 14,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Separator line ────────────────────────────────────────────────────────
+class _Divider extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 1,
+      height: 28,
+      margin: const EdgeInsets.symmetric(horizontal: 6),
+      color: Colors.white.withOpacity(0.12),
+    );
+  }
+}

@@ -1,0 +1,1 @@
+{"flutter":{"platforms":{"android":{"default":{"projectId":"oboia-server","appId":"1:223722007359:android:58c3b226aaa322d0c0418a","fileOutput":"android/app/google-services.json"}},"dart":{"lib/firebase_options.dart":{"projectId":"oboia-server","configurations":{"android":"1:223722007359:android:58c3b226aaa322d0c0418a","ios":"1:223722007359:ios:294db5abebe5618dc0418a"}}}}}}

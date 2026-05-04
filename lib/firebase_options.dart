@@ -33,21 +33,24 @@ class DefaultFirebaseOptions {
 
   // IMPORTANT: After running `flutterfire configure` you will get proper
   // per-platform appIds. For now we fall back to the web appId so the app
-  // can initialize. Replace these when you run flutterfire configure.
+
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyA19aEUkdcbph_SiWeELXPlDLL0GtsHc-w',
-    appId: '1:223722007359:android:REPLACE_AFTER_FLUTTERFIRE_CONFIGURE',
+    apiKey: 'AIzaSyATQwItQxk0nZI_yI5pIl72xoi3idNevNY',
+    appId: '1:223722007359:android:58c3b226aaa322d0c0418a',
     messagingSenderId: '223722007359',
     projectId: 'oboia-server',
     storageBucket: 'oboia-server.firebasestorage.app',
   );
 
+  // can initialize. Replace these when you run flutterfire configure.
+
   static const FirebaseOptions ios = FirebaseOptions(
-    apiKey: 'AIzaSyA19aEUkdcbph_SiWeELXPlDLL0GtsHc-w',
-    appId: '1:223722007359:ios:REPLACE_AFTER_FLUTTERFIRE_CONFIGURE',
+    apiKey: 'AIzaSyB6iHyiXlfla7UTa8DAStgrWs2cyT44w2I',
+    appId: '1:223722007359:ios:294db5abebe5618dc0418a',
     messagingSenderId: '223722007359',
     projectId: 'oboia-server',
     storageBucket: 'oboia-server.firebasestorage.app',
-    iosBundleId: 'com.oboia.app',
+    iosBundleId: 'com.oboia.oboia',
   );
+
 }

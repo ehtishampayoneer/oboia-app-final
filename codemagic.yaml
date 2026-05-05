@@ -3,26 +3,22 @@ workflows:
     name: iOS Workflow
     max_build_duration: 120
     instance_type: mac_mini_m2
-
     integrations:
       app_store_connect: Codemagic
-
     environment:
-      groups:
-        - app_store_credentials   # 🔥 THIS FIXES YOUR ISSUE
-
       ios_signing:
         distribution_type: app_store
         bundle_identifier: com.oboia.app
-
       flutter: stable
       xcode: latest
       cocoapods: default
-
     scripts:
       - name: Set up code signing
         script: |
           keychain initialize
+          app-store-connect fetch-signing-files com.oboia.app \
+            --type IOS_APP_STORE \
+            --create
           keychain add-certificates
           xcode-project use-profiles
 
@@ -34,7 +30,6 @@ workflows:
           project = Xcodeproj::Project.open('ios/Runner.xcodeproj')
           target = project.targets.find { |t| t.name == 'Runner' }
           group = project.main_group['Runner']
-
           files = [
             'ARWallpaperView.swift',
             'ARWallpaperViewFactory.swift',
@@ -42,28 +37,22 @@ workflows:
             'WallpaperCutTool.swift',
             'CutModeOverlay.swift'
           ]
-
           files.each do |filename|
             unless group.files.any? { |f| f.path == filename }
               ref = group.new_file(filename)
               target.source_build_phase.add_file_reference(ref)
             end
           end
-
           project.save
           RUBY
-
-      - name: Force iOS 16 everywhere
-        script: |
-          sed -i '' 's/platform :ios, .*/platform :ios, '\''16.0'\''/' ios/Podfile
-          sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*/IPHONEOS_DEPLOYMENT_TARGET = 16.0/g' ios/Runner.xcodeproj/project.pbxproj
 
       - name: Get Flutter packages
         script: flutter pub get
 
-      - name: Build iOS (with proper export)
+      - name: Build iOS
         script: |
-          flutter build ipa --release --export-method=app-store
+          flutter build ipa --release \
+            --export-options-plist=/Users/builder/export_options.plist
 
     artifacts:
       - build/ios/ipa/*.ipa

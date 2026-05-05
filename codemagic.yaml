@@ -23,7 +23,6 @@ workflows:
           keychain add-certificates
           xcode-project use-profiles
 
-      # ✅ IMPORTANT — add this back
       - name: Register AR Swift files
         script: |
           gem install xcodeproj --quiet
@@ -51,12 +50,16 @@ workflows:
           project.save
           RUBY
 
+      - name: Force iOS 16 everywhere
+        script: |
+          sed -i '' 's/platform :ios, .*/platform :ios, '\''16.0'\''/' ios/Podfile
+          sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*/IPHONEOS_DEPLOYMENT_TARGET = 16.0/g' ios/Runner.xcodeproj/project.pbxproj
+
       - name: Get Flutter packages
         script: flutter pub get
 
       - name: Build iOS
-        script: |
-          flutter build ipa --release
+        script: flutter build ipa --release
 
     artifacts:
       - build/ios/ipa/*.ipa

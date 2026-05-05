@@ -23,6 +23,34 @@ workflows:
           keychain add-certificates
           xcode-project use-profiles
 
+      # ✅ IMPORTANT — add this back
+      - name: Register AR Swift files
+        script: |
+          gem install xcodeproj --quiet
+          ruby << 'RUBY'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open('ios/Runner.xcodeproj')
+          target = project.targets.find { |t| t.name == 'Runner' }
+          group = project.main_group['Runner']
+
+          files = [
+            'ARWallpaperView.swift',
+            'ARWallpaperViewFactory.swift',
+            'TextureCache.swift',
+            'WallpaperCutTool.swift',
+            'CutModeOverlay.swift'
+          ]
+
+          files.each do |filename|
+            unless group.files.any? { |f| f.path == filename }
+              ref = group.new_file(filename)
+              target.source_build_phase.add_file_reference(ref)
+            end
+          end
+
+          project.save
+          RUBY
+
       - name: Get Flutter packages
         script: flutter pub get
 

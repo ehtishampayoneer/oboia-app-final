@@ -8,6 +8,9 @@ workflows:
       app_store_connect: Codemagic
 
     environment:
+      groups:
+        - app_store_credentials   # 🔥 THIS FIXES YOUR ISSUE
+
       ios_signing:
         distribution_type: app_store
         bundle_identifier: com.oboia.app

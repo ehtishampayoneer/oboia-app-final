@@ -17,11 +17,18 @@ workflows:
       cocoapods: default
 
     scripts:
+      - name: Set up code signing
+        script: |
+          keychain initialize
+          keychain add-certificates
+          xcode-project use-profiles
+
       - name: Get Flutter packages
         script: flutter pub get
 
       - name: Build iOS
-        script: flutter build ipa --release
+        script: |
+          flutter build ipa --release
 
     artifacts:
       - build/ios/ipa/*.ipa

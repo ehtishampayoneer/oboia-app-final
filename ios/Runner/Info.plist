@@ -31,32 +31,31 @@
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
-
-	<!-- AR / camera -->
 	<key>NSCameraUsageDescription</key>
 	<string>OBOIA needs the camera so you can preview wallpapers on your walls in AR.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>OBOIA needs access to your photos so you can set a profile picture.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>OBOIA does not record audio; this declaration exists only because AR sessions may request it on some devices.</string>
-
-	<!-- ARKit required -->
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arkit</string>
 	</array>
-
-	<!-- Google Sign-In: replace YOUR-REVERSED-CLIENT-ID after flutterfire configure -->
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -68,8 +67,7 @@
 			</array>
 		</dict>
 	</array>
-
 	<key>MinimumOSVersion</key>
-	<string>12.0</string>
+	<string>16.0</string>
 </dict>
 </plist>

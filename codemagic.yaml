@@ -58,8 +58,9 @@ workflows:
       - name: Get Flutter packages
         script: flutter pub get
 
-      - name: Build iOS
-        script: flutter build ipa --release
+      - name: Build iOS (with proper export)
+        script: |
+          flutter build ipa --release --export-method=app-store
 
     artifacts:
       - build/ios/ipa/*.ipa

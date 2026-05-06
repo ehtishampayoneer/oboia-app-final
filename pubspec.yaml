@@ -1,7 +1,7 @@
 name: oboia
 description: OBOIA — AR wallpaper marketplace.
 publish_to: 'none'
-version: 1.0.0+5
+version: 1.0.0+6
 
 environment:
   sdk: '>=3.3.0 <4.0.0'
@@ -12,11 +12,11 @@ dependencies:
     sdk: flutter
 
   # Firebase
-  firebase_core: ^3.6.0
-  firebase_auth: ^5.3.0
-  cloud_firestore: ^5.4.0
-  firebase_storage: ^12.3.0
-  google_sign_in: ^6.3.0
+  firebase_core: ^4.7.0
+  firebase_auth: ^6.4.0
+  cloud_firestore: ^6.3.0
+  firebase_storage: ^13.3.0
+  google_sign_in: ^7.2.0
 
   # State management
   provider: ^6.1.2

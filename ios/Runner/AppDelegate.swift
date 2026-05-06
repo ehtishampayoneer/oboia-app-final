@@ -1,6 +1,5 @@
 import UIKit
 import Flutter
-import FirebaseCore
 
 @main
 @objc class AppDelegate: FlutterAppDelegate {
@@ -10,7 +9,6 @@ import FirebaseCore
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
 
-        FirebaseApp.configure()
         GeneratedPluginRegistrant.register(with: self)
 
         if let registrar = self.registrar(forPlugin: "ARWallpaperPlugin") {

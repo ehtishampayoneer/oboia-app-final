@@ -16,7 +16,7 @@ dependencies:
   firebase_auth: ^6.4.0
   cloud_firestore: ^6.3.0
   firebase_storage: ^13.3.0
-  google_sign_in: ^7.2.0
+  google_sign_in: ^6.3.0
 
   # State management
   provider: ^6.1.2

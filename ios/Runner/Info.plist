@@ -63,7 +63,7 @@
 			<string>Editor</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>com.googleusercontent.apps.YOUR-REVERSED-CLIENT-ID</string>
+				<string>com.oboia.app</string>
 			</array>
 		</dict>
 	</array>

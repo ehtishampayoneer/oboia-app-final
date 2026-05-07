@@ -47,6 +47,14 @@ class AREvent {
       : (data['cutCount'] as num?)?.toInt();
 
   String? get tool => data['tool'] as String?;
+
+  // CHANGED: Lock event accessor ------------------------------------------
+  bool? get locked => data['locked'] as bool?;
+
+  // CHANGED: Obstacle hint accessor ---------------------------------------
+  int? get obstacleCount => data['count'] is int
+      ? data['count'] as int
+      : (data['count'] as num?)?.toInt();
 }
 
 /// Wall measurements computed from an AR plane extent.
@@ -100,7 +108,9 @@ class ARService {
   bool _initialized = false;
 
   /// Stream of native events (wallDetected, wallUpdated, wallSelected,
-  /// wallpaperPlaced, cutUpdate, cutModeDone, cutToolChanged, error, …).
+  /// wallpaperPlaced, cutUpdate, cutModeDone, cutToolChanged,
+  /// wallLockChanged, obstacleHint, sessionInterrupted, sessionResumed,
+  /// error, …).
   Stream<AREvent> get events => _controller.stream;
 
   /// Should be called once when the AR screen opens.
@@ -203,6 +213,21 @@ class ARService {
       height: (res['height'] as num).toDouble(),
       sqm: (res['sqm'] as num).toDouble(),
     );
+  }
+
+  /// CHANGED: Lock or unlock a wall.
+  ///
+  /// When locked, the native AR engine stops resizing the wall as ARKit
+  /// refines the plane estimate. This lets the user walk around the room
+  /// without the wallpaper subtly shifting. Unlocking resumes tracking.
+  Future<void> lockWall({
+    required int wallIndex,
+    required bool locked,
+  }) async {
+    await _channel.invokeMethod<void>('lockWall', {
+      'wallIndex': wallIndex,
+      'locked': locked,
+    });
   }
 
   Future<void> disposeAR() async {

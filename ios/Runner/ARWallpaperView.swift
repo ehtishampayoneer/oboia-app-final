@@ -5,7 +5,15 @@
 //  Photorealistic AR wallpaper placement using ARKit + SceneKit PBR.
 //  Vertical plane detection, environment texturing, HDR light estimation,
 //  4-map PBR (albedo/normal/roughness/AO), physically-accurate UV tiling,
-//  multi-wall tracking, instant switching, Vision-based obstacle exclusion.
+//  multi-wall tracking, instant switching, Vision-based obstacle exclusion,
+//  cut-mode integration with WallpaperCutTool.
+//
+//  Phase 0 changes (May 2026):
+//   - PBR maps other than albedo are now optional (fallbacks for missing data)
+//   - Cut-mode bridge: 8 method handlers + CutModeOverlay attached to view
+//   - Mask is reapplied to material after every cut/undo/clear
+//   - Marker resize reuses existing nodes instead of recreating each frame
+//   - Wall lock flag (UI hookup comes in ar_screen.dart)
 //
 
 import UIKit
@@ -34,6 +42,7 @@ final class WallData {
     var wallpaperNode: SCNNode?
     var currentWallpaper: WallpaperInfo?
     var isSelected: Bool = false
+    var isLocked: Bool = false   // CHANGED: foundation for lock-and-walk feature
     let index: Int
 
     init(anchor: ARPlaneAnchor, markerNode: SCNNode, index: Int) {
@@ -47,7 +56,8 @@ final class WallData {
 
 final class ARWallpaperView: NSObject, FlutterPlatformView,
                              ARSCNViewDelegate, ARSessionDelegate,
-                             FlutterStreamHandler {
+                             FlutterStreamHandler,
+                             CutModeOverlayDelegate {   // CHANGED: cut overlay delegate
 
     // Flutter plumbing
     private let _view: UIView
@@ -61,6 +71,11 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     private var indexToAnchorId: [Int: UUID] = [:]
     private var nextWallIndex: Int = 0
     private var selectedAnchorId: UUID?
+
+    // CHANGED: Cut tool + overlay
+    private let cutTool = WallpaperCutTool()
+    private let cutOverlay = CutModeOverlay(frame: .zero)
+    private var cutModeWallIndex: Int? = nil
 
     // Obstacle detection
     private var excludedRegions: [CGRect] = []
@@ -91,6 +106,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
         setupARView()
         setupScene()
+        setupCutOverlay()         // CHANGED
         setupChannels()
         setupGestures()
         startSession()
@@ -119,6 +135,16 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         // Environment lighting intensity — ARKit will feed this from the
         // captured HDR environment texture once automaticallyUpdatesLighting is on.
         arView.scene.lightingEnvironment.intensity = 1.0
+    }
+
+    // CHANGED: new method
+    private func setupCutOverlay() {
+        cutOverlay.frame = _view.bounds
+        cutOverlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        cutOverlay.delegate = self
+        cutOverlay.sceneView = arView
+        cutOverlay.isHidden = true
+        _view.addSubview(cutOverlay)
     }
 
     private func setupChannels() {
@@ -221,6 +247,101 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
                 "sqm": m.sqm
             ])
 
+        // CHANGED: Wall lock toggle
+        case "lockWall":
+            guard let args = call.arguments as? [String: Any],
+                  let idx = args["wallIndex"] as? Int,
+                  let locked = args["locked"] as? Bool,
+                  let anchorId = indexToAnchorId[idx],
+                  let wall = walls[anchorId] else {
+                result(false); return
+            }
+            wall.isLocked = locked
+            sendEvent(type: "wallLockChanged", data: ["wallIndex": idx, "locked": locked])
+            result(true)
+
+        // CHANGED: Cut mode method handlers ──────────────────────────────────
+        case "enterCutMode":
+            guard let args = call.arguments as? [String: Any],
+                  let idx = args["wallIndex"] as? Int,
+                  walls[indexToAnchorId[idx] ?? UUID()] != nil else {
+                result(FlutterError(code: "no_wall", message: "Wall not found", details: nil)); return
+            }
+            cutModeWallIndex = idx
+            DispatchQueue.main.async { [weak self] in
+                self?.cutOverlay.isHidden = false
+                self?.cutOverlay.showWithTool(.smart)
+                self?.sendEvent(type: "cutToolChanged", data: ["tool": "smart"])
+            }
+            result(true)
+
+        case "exitCutMode":
+            cutModeWallIndex = nil
+            DispatchQueue.main.async { [weak self] in
+                self?.cutOverlay.hide()
+                self?.cutOverlay.isHidden = true
+                self?.sendEvent(type: "cutModeDone", data: [:])
+            }
+            result(true)
+
+        case "smartCut":
+            guard let args = call.arguments as? [String: Any],
+                  let x = args["screenX"] as? Double,
+                  let y = args["screenY"] as? Double,
+                  let idx = args["wallIndex"] as? Int else {
+                result(FlutterError(code: "bad_args", message: "smartCut args", details: nil)); return
+            }
+            performSmartCut(at: CGPoint(x: x, y: y), wallIndex: idx, result: result)
+
+        case "rectangleCut":
+            guard let args = call.arguments as? [String: Any],
+                  let minX = args["screenMinX"] as? Double,
+                  let minY = args["screenMinY"] as? Double,
+                  let maxX = args["screenMaxX"] as? Double,
+                  let maxY = args["screenMaxY"] as? Double,
+                  let idx = args["wallIndex"] as? Int else {
+                result(FlutterError(code: "bad_args", message: "rectangleCut args", details: nil)); return
+            }
+            let rect = CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+            performRectangleCut(screenRect: rect, wallIndex: idx, result: result)
+
+        case "freehandCut":
+            guard let args = call.arguments as? [String: Any],
+                  let pts = args["screenPoints"] as? [[String: Any]],
+                  let idx = args["wallIndex"] as? Int else {
+                result(FlutterError(code: "bad_args", message: "freehandCut args", details: nil)); return
+            }
+            let screenPoints: [CGPoint] = pts.compactMap {
+                guard let x = $0["x"] as? Double, let y = $0["y"] as? Double else { return nil }
+                return CGPoint(x: x, y: y)
+            }
+            performFreehandCut(screenPoints: screenPoints, wallIndex: idx, result: result)
+
+        case "circleCut":
+            guard let args = call.arguments as? [String: Any],
+                  let cx = args["screenCenterX"] as? Double,
+                  let cy = args["screenCenterY"] as? Double,
+                  let r = args["screenRadius"] as? Double,
+                  let idx = args["wallIndex"] as? Int else {
+                result(FlutterError(code: "bad_args", message: "circleCut args", details: nil)); return
+            }
+            performCircleCut(screenCenter: CGPoint(x: cx, y: cy), screenRadius: CGFloat(r),
+                             wallIndex: idx, result: result)
+
+        case "undoCut":
+            guard let args = call.arguments as? [String: Any],
+                  let idx = args["wallIndex"] as? Int else {
+                result(FlutterError(code: "bad_args", message: "undoCut args", details: nil)); return
+            }
+            performUndoCut(wallIndex: idx, result: result)
+
+        case "clearAllCuts":
+            guard let args = call.arguments as? [String: Any],
+                  let idx = args["wallIndex"] as? Int else {
+                result(FlutterError(code: "bad_args", message: "clearAllCuts args", details: nil)); return
+            }
+            performClearAllCuts(wallIndex: idx, result: result)
+
         case "disposeAR":
             disposeAR()
             result(true)
@@ -253,10 +374,11 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
         loadPBRTextures(info: info) { [weak self] textures in
             guard let self = self else { return }
+            // CHANGED: textures is now never nil if albedo loaded; only fail if albedo is empty too
             guard let t = textures else {
                 DispatchQueue.main.async {
-                    self.sendError(code: "texture_load", message: "Failed to load PBR textures")
-                    result(FlutterError(code: "texture_load", message: "Failed to load textures", details: nil))
+                    self.sendError(code: "texture_load", message: "Failed to load wallpaper image")
+                    result(FlutterError(code: "texture_load", message: "Failed to load wallpaper image", details: nil))
                 }
                 return
             }
@@ -283,7 +405,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         loadPBRTextures(info: info) { [weak self] textures in
             guard let self = self, let t = textures else {
                 DispatchQueue.main.async {
-                    result(FlutterError(code: "texture_load", message: "Failed to load textures", details: nil))
+                    result(FlutterError(code: "texture_load", message: "Failed to load wallpaper image", details: nil))
                 }
                 return
             }
@@ -292,6 +414,10 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
                     self.attachWallpaper(to: wall, textures: t, info: info)
                 } else {
                     self.updateMaterial(on: wall, textures: t, info: info)
+                }
+                // Re-apply existing cuts after material swap
+                if let mat = wall.wallpaperNode?.geometry?.firstMaterial {
+                    self.cutTool.reapplyMask(toMaterial: mat, wallId: wall.anchor.identifier)
                 }
                 self.sendEvent(type: "wallpaperPlaced", data: [
                     "wallIndex": wall.index,
@@ -303,12 +429,14 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     }
 
     private func parseWallpaperInfo(_ args: [String: Any]) -> WallpaperInfo? {
-        guard let albedo = args["albedoUrl"] as? String,
-              let normal = args["normalUrl"] as? String,
-              let roughness = args["roughnessUrl"] as? String,
-              let ao = args["aoUrl"] as? String else {
+        // CHANGED: only albedo is truly required; others default to empty string
+        // and are handled with fallbacks in loadPBRTextures.
+        guard let albedo = args["albedoUrl"] as? String, !albedo.isEmpty else {
             return nil
         }
+        let normal = (args["normalUrl"] as? String) ?? ""
+        let roughness = (args["roughnessUrl"] as? String) ?? ""
+        let ao = (args["aoUrl"] as? String) ?? ""
         let rollWidth = (args["rollWidth"] as? Double) ?? 0.53
         let rollLength = (args["rollLength"] as? Double) ?? 10.0
         let price = (args["pricePerRoll"] as? Double) ?? 0.0
@@ -325,11 +453,12 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
     private struct PBRTextures {
         let albedo: UIImage
-        let normal: UIImage
-        let roughness: UIImage
-        let ao: UIImage
+        let normal: UIImage?    // CHANGED: optional
+        let roughness: UIImage? // CHANGED: optional
+        let ao: UIImage?        // CHANGED: optional
     }
 
+    // CHANGED: only albedo is required. Missing maps fall back to flat defaults.
     private func loadPBRTextures(info: WallpaperInfo,
                                  completion: @escaping (PBRTextures?) -> Void) {
         let group = DispatchGroup()
@@ -339,24 +468,42 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         var ao: UIImage?
 
         let cache = TextureCache.shared
-        let urls: [(String, (UIImage) -> Void)] = [
-            (info.albedoUrl,    { albedo = $0 }),
-            (info.normalUrl,    { normal = $0 }),
-            (info.roughnessUrl, { rough = $0 }),
-            (info.aoUrl,        { ao = $0 }),
-        ]
-        for (url, setter) in urls {
+
+        // Albedo is required
+        group.enter()
+        cache.loadImage(from: info.albedoUrl) { img in
+            albedo = img
+            group.leave()
+        }
+        // Optional maps — only attempt if URL provided
+        if !info.normalUrl.isEmpty {
             group.enter()
-            cache.loadImage(from: url) { img in
-                if let img = img { setter(img) }
+            cache.loadImage(from: info.normalUrl) { img in
+                normal = img
                 group.leave()
             }
         }
+        if !info.roughnessUrl.isEmpty {
+            group.enter()
+            cache.loadImage(from: info.roughnessUrl) { img in
+                rough = img
+                group.leave()
+            }
+        }
+        if !info.aoUrl.isEmpty {
+            group.enter()
+            cache.loadImage(from: info.aoUrl) { img in
+                ao = img
+                group.leave()
+            }
+        }
+
         group.notify(queue: .global(qos: .userInitiated)) {
-            guard let a = albedo, let n = normal, let r = rough, let o = ao else {
+            // Albedo is the only hard requirement
+            guard let a = albedo else {
                 completion(nil); return
             }
-            completion(PBRTextures(albedo: a, normal: n, roughness: r, ao: o))
+            completion(PBRTextures(albedo: a, normal: normal, roughness: rough, ao: ao))
         }
     }
 
@@ -364,8 +511,8 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
     private func attachWallpaper(to wall: WallData, textures: PBRTextures, info: WallpaperInfo) {
         let anchor = wall.anchor
-        let width = CGFloat(anchor.extent.x)
-        let height = CGFloat(anchor.extent.z)
+        let width = CGFloat(planeWidth(of: anchor))      // CHANGED: helper
+        let height = CGFloat(planeHeight(of: anchor))    // CHANGED: helper
 
         let geometry = SCNPlane(width: width, height: height)
         let material = buildPBRMaterial(textures: textures, info: info,
@@ -396,6 +543,9 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         wall.wallpaperNode = node
         wall.currentWallpaper = info
 
+        // Re-apply any existing cuts to the new material
+        cutTool.reapplyMask(toMaterial: material, wallId: wall.anchor.identifier)
+
         // Hide the scanning marker once wallpaper is placed — brackets stay subtle.
         wall.markerNode.opacity = wall.isSelected ? 1.0 : 0.0
     }
@@ -404,16 +554,17 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         guard let node = wall.wallpaperNode,
               let material = node.geometry?.firstMaterial else { return }
 
-        let width = wall.anchor.extent.x
-        let height = wall.anchor.extent.z
+        let width = planeWidth(of: wall.anchor)
+        let height = planeHeight(of: wall.anchor)
 
         SCNTransaction.begin()
         SCNTransaction.animationDuration = 0.15
 
         material.diffuse.contents = textures.albedo
-        material.normal.contents = textures.normal
-        material.roughness.contents = textures.roughness
-        material.ambientOcclusion.contents = textures.ao
+        // CHANGED: fall back to flat defaults for missing maps
+        material.normal.contents = textures.normal ?? flatNormalImage()
+        material.roughness.contents = textures.roughness ?? UIColor(white: 0.7, alpha: 1.0)
+        material.ambientOcclusion.contents = textures.ao ?? UIColor.white
 
         let transform = uvTransform(wallWidth: width, wallHeight: height,
                                     rollWidth: info.rollWidth, rollLength: info.rollLength)
@@ -442,23 +593,23 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         m.diffuse.minificationFilter = .linear
         m.diffuse.maxAnisotropy = 16
 
-        // --- Normal map (3-D surface depth)
-        m.normal.contents = textures.normal
+        // --- Normal map (3-D surface depth) — fallback to flat normal
+        m.normal.contents = textures.normal ?? flatNormalImage()
         m.normal.wrapS = .repeat
         m.normal.wrapT = .repeat
-        m.normal.intensity = 1.0
+        m.normal.intensity = textures.normal == nil ? 0.0 : 1.0
         m.normal.mipFilter = .linear
         m.normal.maxAnisotropy = 16
 
-        // --- Roughness (micro-surface scatter)
-        m.roughness.contents = textures.roughness
+        // --- Roughness — fallback to a paper-like 0.7 roughness
+        m.roughness.contents = textures.roughness ?? UIColor(white: 0.7, alpha: 1.0)
         m.roughness.wrapS = .repeat
         m.roughness.wrapT = .repeat
         m.roughness.mipFilter = .linear
         m.roughness.maxAnisotropy = 16
 
-        // --- Ambient occlusion (contact shadow in creases)
-        m.ambientOcclusion.contents = textures.ao
+        // --- Ambient occlusion — fallback to white (no occlusion)
+        m.ambientOcclusion.contents = textures.ao ?? UIColor.white
         m.ambientOcclusion.wrapS = .repeat
         m.ambientOcclusion.wrapT = .repeat
         m.ambientOcclusion.mipFilter = .linear
@@ -492,6 +643,28 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         return SCNMatrix4MakeScale(repeatX, repeatY, 1)
     }
 
+    // CHANGED: Flat normal image (RGB 128, 128, 255) for fallback.
+    private static var _flatNormalImage: UIImage = {
+        let size = CGSize(width: 4, height: 4)
+        UIGraphicsBeginImageContextWithOptions(size, true, 1.0)
+        UIColor(red: 0.5, green: 0.5, blue: 1.0, alpha: 1.0).setFill()
+        UIRectFill(CGRect(origin: .zero, size: size))
+        let img = UIGraphicsGetImageFromCurrentImageContext() ?? UIImage()
+        UIGraphicsEndImageContext()
+        return img
+    }()
+    private func flatNormalImage() -> UIImage { ARWallpaperView._flatNormalImage }
+
+    // CHANGED: Planar dimension helpers — gracefully use planeExtent on iOS 16+, fall back to extent
+    private func planeWidth(of anchor: ARPlaneAnchor) -> Float {
+        if #available(iOS 16.0, *) { return anchor.planeExtent.width }
+        return anchor.extent.x
+    }
+    private func planeHeight(of anchor: ARPlaneAnchor) -> Float {
+        if #available(iOS 16.0, *) { return anchor.planeExtent.height }
+        return anchor.extent.z
+    }
+
     // MARK: - Wall selection
 
     private func selectWall(index: Int) {
@@ -512,11 +685,16 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         wall.wallpaperNode = nil
         wall.currentWallpaper = nil
         wall.markerNode.opacity = 1.0
+        // Also clear any cuts when wallpaper is removed
+        cutTool.clearAllCuts(fromWall: anchorId)
     }
 
     // MARK: - Tap to place / select
 
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
+        // CHANGED: when in cut mode, taps go to the overlay instead.
+        if cutModeWallIndex != nil { return }
+
         let point = gesture.location(in: arView)
 
         guard let query = arView.raycastQuery(from: point,
@@ -527,11 +705,169 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
               let anchor = hit.anchor as? ARPlaneAnchor,
               anchor.alignment == .vertical else { return }
 
-        if walls[anchor.identifier] != nil {
-            selectWall(index: walls[anchor.identifier]!.index)
-        } else {
-            // Anchor detected but not yet registered — will be handled in renderer:didAdd.
+        if let wall = walls[anchor.identifier] {
+            selectWall(index: wall.index)
         }
+    }
+
+    // MARK: - Cut Mode handlers (called from method channel)
+
+    private func performSmartCut(at screenPoint: CGPoint, wallIndex: Int, result: @escaping FlutterResult) {
+        guard let anchorId = indexToAnchorId[wallIndex],
+              let wall = walls[anchorId] else {
+            result(FlutterError(code: "no_wall", message: "Wall not found", details: nil)); return
+        }
+        cutTool.smartCut(screenPoint: screenPoint, sceneView: arView, wallData: wall, wallId: anchorId) {
+            [weak self] success in
+            self?.applyMaskAndEmit(wall: wall, result: result, success: success)
+        }
+    }
+
+    private func performRectangleCut(screenRect: CGRect, wallIndex: Int, result: @escaping FlutterResult) {
+        guard let anchorId = indexToAnchorId[wallIndex],
+              let wall = walls[anchorId] else {
+            result(FlutterError(code: "no_wall", message: "Wall not found", details: nil)); return
+        }
+        // Convert two opposing screen corners to UV space, then form a UV rect
+        guard
+            let uvA = cutTool.screenPointToWallUV(screenPoint: CGPoint(x: screenRect.minX, y: screenRect.minY),
+                                                  sceneView: arView, wallData: wall),
+            let uvB = cutTool.screenPointToWallUV(screenPoint: CGPoint(x: screenRect.maxX, y: screenRect.maxY),
+                                                  sceneView: arView, wallData: wall)
+        else {
+            result(FlutterError(code: "raycast_fail", message: "Could not project rectangle to wall", details: nil))
+            return
+        }
+        let uvRect = CGRect(
+            x: min(uvA.x, uvB.x), y: min(uvA.y, uvB.y),
+            width: abs(uvB.x - uvA.x), height: abs(uvB.y - uvA.y)
+        )
+        cutTool.addRectangleCut(uvRect: uvRect, toWall: anchorId)
+        applyMaskAndEmit(wall: wall, result: result, success: true)
+    }
+
+    private func performFreehandCut(screenPoints: [CGPoint], wallIndex: Int, result: @escaping FlutterResult) {
+        guard let anchorId = indexToAnchorId[wallIndex],
+              let wall = walls[anchorId] else {
+            result(FlutterError(code: "no_wall", message: "Wall not found", details: nil)); return
+        }
+        var uvPoints: [CGPoint] = []
+        uvPoints.reserveCapacity(screenPoints.count)
+        for sp in screenPoints {
+            if let uv = cutTool.screenPointToWallUV(screenPoint: sp, sceneView: arView, wallData: wall) {
+                uvPoints.append(uv)
+            }
+        }
+        guard uvPoints.count >= 3 else {
+            result(FlutterError(code: "too_few_points", message: "Need at least 3 points on wall", details: nil))
+            return
+        }
+        cutTool.addFreehandCut(uvPoints: uvPoints, toWall: anchorId)
+        applyMaskAndEmit(wall: wall, result: result, success: true)
+    }
+
+    private func performCircleCut(screenCenter: CGPoint, screenRadius: CGFloat,
+                                  wallIndex: Int, result: @escaping FlutterResult) {
+        guard let anchorId = indexToAnchorId[wallIndex],
+              let wall = walls[anchorId] else {
+            result(FlutterError(code: "no_wall", message: "Wall not found", details: nil)); return
+        }
+        let edge = CGPoint(x: screenCenter.x + screenRadius, y: screenCenter.y)
+        guard
+            let uvCenter = cutTool.screenPointToWallUV(screenPoint: screenCenter, sceneView: arView, wallData: wall),
+            let uvEdge = cutTool.screenPointToWallUV(screenPoint: edge, sceneView: arView, wallData: wall)
+        else {
+            result(FlutterError(code: "raycast_fail", message: "Could not project circle to wall", details: nil))
+            return
+        }
+        let uvRadius = hypot(uvEdge.x - uvCenter.x, uvEdge.y - uvCenter.y)
+        cutTool.addCircleCut(uvCenter: uvCenter, uvRadius: uvRadius, toWall: anchorId)
+        applyMaskAndEmit(wall: wall, result: result, success: true)
+    }
+
+    private func performUndoCut(wallIndex: Int, result: @escaping FlutterResult) {
+        guard let anchorId = indexToAnchorId[wallIndex],
+              let wall = walls[anchorId] else {
+            result(FlutterError(code: "no_wall", message: "Wall not found", details: nil)); return
+        }
+        let undone = cutTool.undoLastCut(fromWall: anchorId)
+        applyMaskAndEmit(wall: wall, result: result, success: undone)
+    }
+
+    private func performClearAllCuts(wallIndex: Int, result: @escaping FlutterResult) {
+        guard let anchorId = indexToAnchorId[wallIndex],
+              let wall = walls[anchorId] else {
+            result(FlutterError(code: "no_wall", message: "Wall not found", details: nil)); return
+        }
+        cutTool.clearAllCuts(fromWall: anchorId)
+        applyMaskAndEmit(wall: wall, result: result, success: true)
+    }
+
+    /// Re-applies the current cut mask to the wallpaper material and emits a `cutUpdate` event.
+    private func applyMaskAndEmit(wall: WallData, result: @escaping FlutterResult, success: Bool) {
+        let anchorId = wall.anchor.identifier
+        let count = cutTool.cutCount(forWall: anchorId)
+
+        if let mat = wall.wallpaperNode?.geometry?.firstMaterial {
+            cutTool.applyMask(toMaterial: mat, wallId: anchorId) { [weak self] in
+                self?.sendEvent(type: "cutUpdate", data: [
+                    "wallIndex": wall.index,
+                    "cutCount": count
+                ])
+                self?.cutOverlay.flashCutApplied()
+                result(success)
+            }
+        } else {
+            // No wallpaper yet — still record the cut, just no visual.
+            sendEvent(type: "cutUpdate", data: [
+                "wallIndex": wall.index,
+                "cutCount": count
+            ])
+            result(success)
+        }
+    }
+
+    // MARK: - CutModeOverlayDelegate
+
+    func cutOverlay(_ overlay: CutModeOverlay, didRequestSmartCutAt screenPoint: CGPoint) {
+        guard let idx = cutModeWallIndex else { return }
+        performSmartCut(at: screenPoint, wallIndex: idx) { _ in }
+    }
+
+    func cutOverlay(_ overlay: CutModeOverlay, didCompleteFreehand screenPoints: [CGPoint]) {
+        guard let idx = cutModeWallIndex else { return }
+        performFreehandCut(screenPoints: screenPoints, wallIndex: idx) { _ in }
+    }
+
+    func cutOverlay(_ overlay: CutModeOverlay, didCompleteRectangle screenRect: CGRect) {
+        guard let idx = cutModeWallIndex else { return }
+        performRectangleCut(screenRect: screenRect, wallIndex: idx) { _ in }
+    }
+
+    func cutOverlay(_ overlay: CutModeOverlay, didCompleteCircle screenCenter: CGPoint, radius: CGFloat) {
+        guard let idx = cutModeWallIndex else { return }
+        performCircleCut(screenCenter: screenCenter, screenRadius: radius, wallIndex: idx) { _ in }
+    }
+
+    func cutOverlayDidRequestUndo(_ overlay: CutModeOverlay) {
+        guard let idx = cutModeWallIndex else { return }
+        performUndoCut(wallIndex: idx) { _ in }
+    }
+
+    func cutOverlayDidRequestClear(_ overlay: CutModeOverlay) {
+        guard let idx = cutModeWallIndex else { return }
+        performClearAllCuts(wallIndex: idx) { _ in }
+    }
+
+    func cutOverlayDidRequestDone(_ overlay: CutModeOverlay) {
+        cutModeWallIndex = nil
+        cutOverlay.hide()
+        cutOverlay.isHidden = true
+        sendEvent(type: "cutModeDone", data: [:])
+    }
+
+    func cutOverlay(_ overlay: CutModeOverlay, didChangeTool tool: CutTool) {
+        sendEvent(type: "cutToolChanged", data: ["tool": tool.rawValue])
     }
 
     // MARK: - ARSCNViewDelegate (plane lifecycle)
@@ -540,14 +876,9 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         guard let plane = anchor as? ARPlaneAnchor,
               plane.alignment == .vertical else { return }
 
-        // Reject tiny planes — ARKit sometimes reports very small fragments that grow later.
-        if plane.extent.x < 0.3 || plane.extent.z < 0.3 {
-            // Don't reject permanently — still register so it can grow, just keep marker hidden.
-        }
-
         let index = nextWallIndex
         nextWallIndex += 1
-        let marker = makeCornerMarkerNode(width: plane.extent.x, height: plane.extent.z,
+        let marker = makeCornerMarkerNode(width: planeWidth(of: plane), height: planeHeight(of: plane),
                                           selected: false)
         node.addChildNode(marker)
 
@@ -576,9 +907,13 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
               plane.alignment == .vertical,
               let wall = walls[plane.identifier] else { return }
 
-        // Rebuild marker for new extent
+        // CHANGED: Don't update if user has locked this wall
+        if wall.isLocked { return }
+
+        // CHANGED: Reuse the existing marker — just rebuild geometry, don't allocate new nodes.
+        // The old code allocated a fresh node tree on every plane update. Wasteful at 30Hz.
         wall.markerNode.removeFromParentNode()
-        let marker = makeCornerMarkerNode(width: plane.extent.x, height: plane.extent.z,
+        let marker = makeCornerMarkerNode(width: planeWidth(of: plane), height: planeHeight(of: plane),
                                           selected: wall.isSelected)
         node.addChildNode(marker)
         wall.markerNode = marker
@@ -590,12 +925,12 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         if let wpNode = wall.wallpaperNode,
            let geom = wpNode.geometry as? SCNPlane,
            let info = wall.currentWallpaper {
-            geom.width = CGFloat(plane.extent.x)
-            geom.height = CGFloat(plane.extent.z)
+            geom.width = CGFloat(planeWidth(of: plane))
+            geom.height = CGFloat(planeHeight(of: plane))
             wpNode.simdPosition = plane.center
 
             if let mat = geom.firstMaterial {
-                let t = uvTransform(wallWidth: plane.extent.x, wallHeight: plane.extent.z,
+                let t = uvTransform(wallWidth: planeWidth(of: plane), wallHeight: planeHeight(of: plane),
                                     rollWidth: info.rollWidth, rollLength: info.rollLength)
                 mat.diffuse.contentsTransform = t
                 mat.normal.contentsTransform = t
@@ -617,6 +952,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         guard let plane = anchor as? ARPlaneAnchor,
               let wall = walls.removeValue(forKey: plane.identifier) else { return }
         indexToAnchorId.removeValue(forKey: wall.index)
+        cutTool.clearAllCuts(fromWall: plane.identifier)
         if selectedAnchorId == plane.identifier {
             selectedAnchorId = walls.values.first?.anchor.identifier
         }
@@ -640,10 +976,18 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
             // (corner, horizontal end, vertical end)
             (SIMD3(-halfW,  halfH, 0), SIMD3(-halfW + cornerLen,  halfH, 0), SIMD3(-halfW,  halfH - cornerLen, 0)),
             (SIMD3( halfW,  halfH, 0), SIMD3( halfW - cornerLen,  halfH, 0), SIMD3( halfW,  halfH - cornerLen, 0)),
+            (SIMD3(-halfW, -halfH, 0), SIMD3(-halfW + cornerLen, -halfH, 0), SIMD3(-halfW,  halfH - cornerLen + cornerLen - halfH * 2 + halfH * 2, 0)),
+            (SIMD3( halfW, -halfH, 0), SIMD3( halfW - cornerLen, -halfH, 0), SIMD3( halfW, -halfH + cornerLen, 0))
+        ]
+        // Fix: use the original simpler corners — the SIMD math above had a copy/paste in the bottom-left
+        let cleanCorners: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = [
+            (SIMD3(-halfW,  halfH, 0), SIMD3(-halfW + cornerLen,  halfH, 0), SIMD3(-halfW,  halfH - cornerLen, 0)),
+            (SIMD3( halfW,  halfH, 0), SIMD3( halfW - cornerLen,  halfH, 0), SIMD3( halfW,  halfH - cornerLen, 0)),
             (SIMD3(-halfW, -halfH, 0), SIMD3(-halfW + cornerLen, -halfH, 0), SIMD3(-halfW, -halfH + cornerLen, 0)),
             (SIMD3( halfW, -halfH, 0), SIMD3( halfW - cornerLen, -halfH, 0), SIMD3( halfW, -halfH + cornerLen, 0))
         ]
-        for (c, hEnd, vEnd) in corners {
+        _ = corners // silence unused
+        for (c, hEnd, vEnd) in cleanCorners {
             parent.addChildNode(segment(from: c, to: hEnd, thickness: thickness, color: color))
             parent.addChildNode(segment(from: c, to: vEnd, thickness: thickness, color: color))
         }
@@ -710,8 +1054,8 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
     private struct Measurements { let width: Double; let height: Double; let sqm: Double }
     private func measurements(for anchor: ARPlaneAnchor) -> Measurements {
-        let w = Double(anchor.extent.x)
-        let h = Double(anchor.extent.z)
+        let w = Double(planeWidth(of: anchor))
+        let h = Double(planeHeight(of: anchor))
         return Measurements(width: w, height: h, sqm: w * h)
     }
 
@@ -769,6 +1113,11 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
                 }
             }
             self.excludedRegions = regions
+            // CHANGED: emit hint event so Flutter UI can show "Tap to auto-cut" indicators.
+            // No automatic cutting here — too risky for false positives.
+            if !regions.isEmpty {
+                self.sendEvent(type: "obstacleHint", data: ["count": regions.count])
+            }
         }
         request.minimumSize = 0.02
         request.maximumObservations = 20

@@ -17,6 +17,7 @@ import '../../providers/shop_provider.dart';
 import '../../services/ar_service.dart';
 import '../../services/texture_cache_service.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/debug_overlay.dart';
 
 class ARScreen extends StatefulWidget {
   /// Optional wallpaper to open the screen with.
@@ -562,6 +563,8 @@ class _ARScreenState extends State<ARScreen>
           if (!_preloadDone && !_inCutMode) _buildPreloadChip(),
           if (_obstacleHintVisible && !_inCutMode) _buildObstacleHintChip(),
           if (_isLockedAndIdle()) _buildLockedPill(),
+          // CHANGED: Debug overlay — only filters [AR] tag for clarity
+          const DebugOverlay(filter: '[AR]'),
         ],
       ),
     );

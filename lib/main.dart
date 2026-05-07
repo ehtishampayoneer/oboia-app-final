@@ -5,6 +5,8 @@ import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 
 import 'firebase_options.dart';
+import 'models/shop_model.dart';
+import 'models/wallpaper_model.dart';
 import 'providers/auth_provider.dart';
 import 'providers/cart_provider.dart';
 import 'providers/shop_provider.dart';
@@ -23,10 +25,16 @@ import 'screens/orders/orders_screen.dart';
 import 'screens/profile/profile_screen.dart';
 import 'screens/shop/shop_screen.dart';
 import 'screens/splash_screen.dart';
+import 'services/debug_log_service.dart';
 import 'theme/app_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // CHANGED: Capture all debugPrint output so the in-app debug overlay
+  // can show it. Must run BEFORE anything that prints (Firebase init etc).
+  DebugLogService.instance.attach();
+
   SystemChrome.setSystemUIOverlayStyle(
     const SystemUiOverlayStyle(
       statusBarColor: Colors.transparent,
@@ -120,8 +128,26 @@ class OboiaApp extends StatelessWidget {
         ),
         GoRoute(
           path: '/ar',
-          // Fixed: use ARScreen not ArScreen
-          builder: (_, __) => const ARScreen(),
+          // CHANGED: Accept optional wallpaper + shop via GoRouter `extra`.
+          // Callers can do: context.go('/ar', extra: {'wallpaper': wp, 'shop': shop});
+          // If no extra is passed, ARScreen falls back to ShopProvider state.
+          builder: (_, state) {
+            final extra = state.extra;
+            WallpaperModel? wp;
+            ShopModel? sh;
+            if (extra is Map) {
+              final w = extra['wallpaper'];
+              final s = extra['shop'];
+              if (w is WallpaperModel) wp = w;
+              if (s is ShopModel) sh = s;
+            } else if (extra is WallpaperModel) {
+              wp = extra;
+            }
+            return ARScreen(
+              initialWallpaper: wp,
+              initialShop: sh,
+            );
+          },
         ),
         GoRoute(
           path: '/cart',

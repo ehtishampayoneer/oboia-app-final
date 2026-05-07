@@ -15,11 +15,12 @@ class PbrMaps {
 
   factory PbrMaps.fromMap(Map<String, dynamic>? m) {
     if (m == null) return const PbrMaps();
+    String _clean(String? url) => url?.trim().replaceAll(RegExp(r'^"|"$'), '') ?? '';
     return PbrMaps(
-      albedoUrl: (m['albedoUrl'] as String?) ?? '',
-      normalUrl: (m['normalUrl'] as String?) ?? '',
-      roughnessUrl: (m['roughnessUrl'] as String?) ?? '',
-      aoUrl: (m['aoUrl'] as String?) ?? '',
+      albedoUrl: _clean(m['albedoUrl'] as String?),
+      normalUrl: _clean(m['normalUrl'] as String?),
+      roughnessUrl: _clean(m['roughnessUrl'] as String?),
+      aoUrl: _clean(m['aoUrl'] as String?),
     );
   }
 
@@ -36,11 +37,11 @@ class WallpaperModel {
   final String description;
   final String category;
   final String brand;
-  final double price;        // per roll, UZS
-  final double pricePerSqm;  // UZS
-  final double rollWidth;    // meters
-  final double rollLength;   // meters
-  final int stock;           // rolls available
+  final double price;
+  final double pricePerSqm;
+  final double rollWidth;
+  final double rollLength;
+  final int stock;
   final String shopId;
   final bool isApproved;
   final String? thumbnailUrl;
@@ -67,25 +68,14 @@ class WallpaperModel {
     required this.createdAt,
   });
 
-  // ── Convenience getters ─────────────────────────────────────────────────
-
   bool get inStock => stock > 0;
-
-  /// Price per roll (alias so ar_service can use pricePerRoll)
   double get pricePerRoll => price;
-
-  /// Best available URL to paint on the wall in AR.
   String get arTextureUrl =>
       pbr.albedoUrl.isNotEmpty ? pbr.albedoUrl : (thumbnailUrl ?? '');
 
-  // ── Calculations ────────────────────────────────────────────────────────
+  double sqmForWall(double wallWidth, double wallHeight) =>
+      wallWidth * wallHeight;
 
-  /// sqm needed for a wall
-  double sqmForWall(double wallWidth, double wallHeight) {
-    return wallWidth * wallHeight;
-  }
-
-  /// Rolls needed - ALWAYS round UP
   int rollsNeeded(double wallWidth, double wallHeight) {
     final sqm = sqmForWall(wallWidth, wallHeight);
     final perRoll = rollWidth * rollLength;
@@ -93,12 +83,11 @@ class WallpaperModel {
     return (sqm / perRoll).ceil();
   }
 
-  /// Total price for a wall
-  double totalPriceForWall(double wallWidth, double wallHeight) {
-    return rollsNeeded(wallWidth, wallHeight) * price;
-  }
+  double totalPriceForWall(double wallWidth, double wallHeight) =>
+      rollsNeeded(wallWidth, wallHeight) * price;
 
-  // ── Firestore ───────────────────────────────────────────────────────────
+  static String _cleanUrl(String? url) =>
+      url?.trim().replaceAll(RegExp(r'^"|"$'), '') ?? '';
 
   factory WallpaperModel.fromDoc(DocumentSnapshot doc) {
     final d = (doc.data() as Map<String, dynamic>?) ?? {};
@@ -115,7 +104,7 @@ class WallpaperModel {
       stock: ((d['stock'] ?? 0) as num).toInt(),
       shopId: (d['shopId'] ?? '') as String,
       isApproved: (d['isApproved'] ?? false) as bool,
-      thumbnailUrl: d['thumbnailUrl'] as String?,
+      thumbnailUrl: _cleanUrl(d['thumbnailUrl'] as String?),
       pbr: PbrMaps.fromMap(d['pbr'] as Map<String, dynamic>?),
       processingStatus: d['processingStatus'] as String?,
       createdAt: (d['createdAt'] is Timestamp)
@@ -138,7 +127,7 @@ class WallpaperModel {
       stock: ((d['stock'] ?? 0) as num).toInt(),
       shopId: (d['shopId'] ?? '') as String,
       isApproved: (d['isApproved'] ?? false) as bool,
-      thumbnailUrl: d['thumbnailUrl'] as String?,
+      thumbnailUrl: _cleanUrl(d['thumbnailUrl'] as String?),
       pbr: PbrMaps.fromMap(d['pbr'] as Map<String, dynamic>?),
       processingStatus: d['processingStatus'] as String?,
       createdAt: (d['createdAt'] is Timestamp)
@@ -173,6 +162,4 @@ class WallpaperModel {
   }
 }
 
-// ── Backwards compatibility alias ───────────────────────────────────────────
-// In case any file still uses "Wallpaper" instead of "WallpaperModel"
 typedef Wallpaper = WallpaperModel;

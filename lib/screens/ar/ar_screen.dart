@@ -48,6 +48,15 @@ class _ARScreenState extends State<ARScreen>
   // Which wallpaper is active on each wall index
   final Map<int, WallpaperModel> _wallpaperByWall = {};
 
+  // CHANGED: Cut counts per wall
+  final Map<int, int> _cutCounts = {};
+
+  // CHANGED: Lock state per wall
+  final Map<int, bool> _wallLocked = {};
+
+  // CHANGED: Auto-lock timer per wall (cancelled on movement)
+  final Map<int, Timer> _autoLockTimers = {};
+
   // Pending wallpaper — tapped in bar but not yet placed
   WallpaperModel? _pending;
 
@@ -63,6 +72,15 @@ class _ARScreenState extends State<ARScreen>
   double _preloadProgress = 0.0;
   bool _preloadDone = false;
 
+  // CHANGED: Cut mode state
+  bool _inCutMode = false;
+  String _activeTool = 'smart';
+  int? _cutModeWallIndex;
+
+  // CHANGED: Obstacle hint flash
+  bool _obstacleHintVisible = false;
+  Timer? _obstacleHintTimer;
+
   @override
   void initState() {
     super.initState();
@@ -77,21 +95,17 @@ class _ARScreenState extends State<ARScreen>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    // Resolve shop from widget param or provider
     _currentShop = widget.initialShop ??
         context.read<ShopProvider>().currentShop;
-    // Boot only once
     if (_sub == null) {
       _boot();
     }
   }
 
   Future<void> _boot() async {
-    // Subscribe before init so we don't miss early events
     _sub = _ar.events.listen(_onAREvent);
     await _ar.initAR();
 
-    // Preload textures for all wallpapers from current shop
     if (_currentShop == null) {
       setState(() => _preloadDone = true);
       return;
@@ -100,7 +114,6 @@ class _ARScreenState extends State<ARScreen>
     final shopProvider = context.read<ShopProvider>();
     final wallpapers = shopProvider.wallpapersForShop(_currentShop!.id);
 
-    // Build list of all texture URLs
     final urls = <String>[];
     for (final w in wallpapers) {
       if (w.pbr.albedoUrl.isNotEmpty) urls.add(w.pbr.albedoUrl);
@@ -127,6 +140,10 @@ class _ARScreenState extends State<ARScreen>
   void dispose() {
     _scanCtrl.dispose();
     _sub?.cancel();
+    for (final t in _autoLockTimers.values) {
+      t.cancel();
+    }
+    _obstacleHintTimer?.cancel();
     _ar.disposeAR();
     SystemChrome.setSystemUIOverlayStyle(SystemUiOverlayStyle.dark);
     super.dispose();
@@ -148,7 +165,6 @@ class _ARScreenState extends State<ARScreen>
           );
           _selectedWallIndex ??= idx;
         });
-        // Auto-place the pending wallpaper on first detected wall
         if (_pending != null && _wallpaperByWall[idx] == null) {
           await _placeOn(idx, _pending!);
         }
@@ -165,6 +181,11 @@ class _ARScreenState extends State<ARScreen>
             sqm: e.sqm ?? (e.width! * e.height!),
           );
         });
+        // CHANGED: Wall is moving → cancel auto-lock if pending
+        _autoLockTimers[idx]?.cancel();
+        if (_wallpaperByWall[idx] != null && _wallLocked[idx] != true) {
+          _scheduleAutoLock(idx);
+        }
         break;
 
       case 'wallSelected':
@@ -174,6 +195,72 @@ class _ARScreenState extends State<ARScreen>
         break;
 
       case 'wallpaperPlaced':
+        // CHANGED: Schedule auto-lock after placement
+        final idx = e.wallIndex;
+        if (idx != null) {
+          _scheduleAutoLock(idx);
+        }
+        break;
+
+      // CHANGED: Cut mode events ─────────────────────────────────────────
+      case 'cutUpdate':
+        final idx = e.wallIndex;
+        final count = e.cutCount;
+        if (idx == null || count == null) return;
+        setState(() => _cutCounts[idx] = count);
+        // Light haptic feedback
+        HapticFeedback.lightImpact();
+        break;
+
+      case 'cutToolChanged':
+        final tool = e.tool;
+        if (tool == null) return;
+        setState(() => _activeTool = tool);
+        break;
+
+      case 'cutModeDone':
+        setState(() {
+          _inCutMode = false;
+          _cutModeWallIndex = null;
+        });
+        break;
+
+      // CHANGED: Lock events ─────────────────────────────────────────────
+      case 'wallLockChanged':
+        final idx = e.wallIndex;
+        final locked = e.data['locked'] as bool?;
+        if (idx == null || locked == null) return;
+        setState(() => _wallLocked[idx] = locked);
+        break;
+
+      // CHANGED: Vision hint
+      case 'obstacleHint':
+        _showObstacleHint();
+        break;
+
+      // CHANGED: Session lifecycle
+      case 'sessionInterrupted':
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('AR paused — bring camera back to room'),
+              duration: Duration(seconds: 2),
+              backgroundColor: Colors.black87,
+            ),
+          );
+        }
+        break;
+
+      case 'sessionResumed':
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('AR tracking resumed'),
+              duration: Duration(milliseconds: 800),
+              backgroundColor: Colors.black87,
+            ),
+          );
+        }
         break;
 
       case 'error':
@@ -188,6 +275,34 @@ class _ARScreenState extends State<ARScreen>
         }
         break;
     }
+  }
+
+  // CHANGED: Auto-lock after 1.5s of no plane updates
+  void _scheduleAutoLock(int wallIndex) {
+    _autoLockTimers[wallIndex]?.cancel();
+    _autoLockTimers[wallIndex] = Timer(
+      const Duration(milliseconds: 1500),
+      () async {
+        if (!mounted) return;
+        if (_wallpaperByWall[wallIndex] == null) return;
+        if (_wallLocked[wallIndex] == true) return;
+        try {
+          await _ar.lockWall(wallIndex: wallIndex, locked: true);
+        } catch (_) {
+          // ignore
+        }
+      },
+    );
+  }
+
+  void _showObstacleHint() {
+    _obstacleHintTimer?.cancel();
+    if (mounted) {
+      setState(() => _obstacleHintVisible = true);
+    }
+    _obstacleHintTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) setState(() => _obstacleHintVisible = false);
+    });
   }
 
   Future<void> _placeOn(int wallIndex, WallpaperModel wallpaper) async {
@@ -221,6 +336,93 @@ class _ARScreenState extends State<ARScreen>
     }
   }
 
+  // CHANGED: Cut-mode controls
+  Future<void> _enterCutMode() async {
+    final idx = _selectedWallIndex;
+    if (idx == null || _wallpaperByWall[idx] == null) return;
+    // Unlock wall first so user can position cuts naturally
+    if (_wallLocked[idx] == true) {
+      await _ar.lockWall(wallIndex: idx, locked: false);
+    }
+    try {
+      await _ar.enterCutMode(idx);
+      setState(() {
+        _inCutMode = true;
+        _cutModeWallIndex = idx;
+        _activeTool = 'smart';
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.message ?? 'Could not enter cut mode')),
+      );
+    }
+  }
+
+  Future<void> _exitCutMode() async {
+    try {
+      await _ar.exitCutMode();
+    } catch (_) {}
+    setState(() {
+      _inCutMode = false;
+      _cutModeWallIndex = null;
+    });
+  }
+
+  Future<void> _setCutTool(String tool) async {
+    setState(() => _activeTool = tool);
+    HapticFeedback.selectionClick();
+  }
+
+  Future<void> _undoLastCut() async {
+    final idx = _cutModeWallIndex;
+    if (idx == null) return;
+    try {
+      await _ar.undoCut(idx);
+      HapticFeedback.lightImpact();
+    } catch (_) {}
+  }
+
+  Future<void> _clearAllCuts() async {
+    final idx = _cutModeWallIndex;
+    if (idx == null) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: const Text('Clear all cuts?',
+            style: TextStyle(color: Colors.white)),
+        content: const Text('This removes every cut on this wall.',
+            style: TextStyle(color: Colors.white70)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Clear',
+                style: TextStyle(color: Colors.redAccent)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await _ar.clearAllCuts(idx);
+      HapticFeedback.mediumImpact();
+    } catch (_) {}
+  }
+
+  Future<void> _toggleLock() async {
+    final idx = _selectedWallIndex;
+    if (idx == null) return;
+    final currentlyLocked = _wallLocked[idx] == true;
+    try {
+      await _ar.lockWall(wallIndex: idx, locked: !currentlyLocked);
+    } catch (_) {}
+  }
+
   // ── UI ──────────────────────────────────────────────────────────────────
 
   @override
@@ -231,16 +433,27 @@ class _ARScreenState extends State<ARScreen>
         fit: StackFit.expand,
         children: [
           _buildNativeARView(),
-          if (_walls.isEmpty) _buildScanningOverlay(),
-          _buildTopBar(),
-          if (_walls.length > 1) _buildWallSelector(),
-          if (_selectedWallIndex != null && _walls.isNotEmpty)
+          if (_walls.isEmpty && !_inCutMode) _buildScanningOverlay(),
+          if (!_inCutMode) _buildTopBar(),
+          if (_inCutMode) _buildCutModeTopBar(),
+          if (_walls.length > 1 && !_inCutMode) _buildWallSelector(),
+          if (_selectedWallIndex != null && _walls.isNotEmpty && !_inCutMode)
             _buildMeasurementsCard(),
-          _buildBottomBar(),
-          if (!_preloadDone) _buildPreloadChip(),
+          if (_inCutMode) _buildCutCountChip(),
+          if (!_inCutMode) _buildBottomBar(),
+          if (!_preloadDone && !_inCutMode) _buildPreloadChip(),
+          if (_obstacleHintVisible && !_inCutMode) _buildObstacleHintChip(),
+          if (_isLockedAndIdle()) _buildLockedPill(),
         ],
       ),
     );
+  }
+
+  bool _isLockedAndIdle() {
+    if (_inCutMode) return false;
+    final idx = _selectedWallIndex;
+    if (idx == null) return false;
+    return _wallLocked[idx] == true && _wallpaperByWall[idx] != null;
   }
 
   // Layer 1 ───────────────────────────────────────────────────────────────
@@ -273,7 +486,7 @@ class _ARScreenState extends State<ARScreen>
     );
   }
 
-  // Layer 2 ───────────────────────────────────────────────────────────────
+  // Scanning overlay ──────────────────────────────────────────────────────
 
   Widget _buildScanningOverlay() {
     return IgnorePointer(
@@ -314,7 +527,7 @@ class _ARScreenState extends State<ARScreen>
     );
   }
 
-  // Layer 4 ───────────────────────────────────────────────────────────────
+  // Measurements card with Cut Mode FAB ───────────────────────────────────
 
   Widget _buildMeasurementsCard() {
     final m = _walls[_selectedWallIndex];
@@ -329,6 +542,8 @@ class _ARScreenState extends State<ARScreen>
       rollLength: wallpaper.rollLength,
     );
     final total = rolls * wallpaper.pricePerRoll;
+    final hasWallpaperPlaced = _wallpaperByWall[_selectedWallIndex] != null;
+    final cutCount = _cutCounts[_selectedWallIndex] ?? 0;
 
     return Positioned(
       top: MediaQuery.of(context).padding.top + 12,
@@ -384,6 +599,12 @@ class _ARScreenState extends State<ARScreen>
                         ),
                       ),
                     ),
+                    const Spacer(),
+                    // CHANGED: Cut mode FAB
+                    if (hasWallpaperPlaced) _CutModeButton(
+                      cutCount: cutCount,
+                      onTap: _enterCutMode,
+                    ),
                   ],
                 ),
               ],
@@ -420,7 +641,7 @@ class _ARScreenState extends State<ARScreen>
     return b.toString();
   }
 
-  // Layer 5 ───────────────────────────────────────────────────────────────
+  // Wall selector ─────────────────────────────────────────────────────────
 
   Widget _buildWallSelector() {
     final indices = _walls.keys.toList()..sort();
@@ -452,15 +673,31 @@ class _ARScreenState extends State<ARScreen>
                       ),
                     ),
                   ),
-                  child: Text(
-                    'Wall ${i + 1}',
-                    style: TextStyle(
-                      color: _selectedWallIndex == i
-                          ? Colors.black
-                          : Colors.white,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 12,
-                    ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        'Wall ${i + 1}',
+                        style: TextStyle(
+                          color: _selectedWallIndex == i
+                              ? Colors.black
+                              : Colors.white,
+                          fontWeight: FontWeight.w600,
+                          fontSize: 12,
+                        ),
+                      ),
+                      // CHANGED: Lock icon next to wall number
+                      if (_wallLocked[i] == true) ...[
+                        const SizedBox(width: 4),
+                        Icon(
+                          Icons.lock,
+                          size: 12,
+                          color: _selectedWallIndex == i
+                              ? Colors.black
+                              : Colors.white,
+                        ),
+                      ],
+                    ],
                   ),
                 ),
               ),
@@ -470,7 +707,7 @@ class _ARScreenState extends State<ARScreen>
     );
   }
 
-  // Layer 6 + top chrome ──────────────────────────────────────────────────
+  // Top bar (normal mode) ─────────────────────────────────────────────────
 
   Widget _buildTopBar() {
     final cart = context.watch<CartProvider>();
@@ -493,6 +730,228 @@ class _ARScreenState extends State<ARScreen>
             onTap: _addCurrentToCart,
           ),
         ],
+      ),
+    );
+  }
+
+  // CHANGED: Top bar (cut mode) ───────────────────────────────────────────
+
+  Widget _buildCutModeTopBar() {
+    return Positioned(
+      top: MediaQuery.of(context).padding.top + 8,
+      left: 12,
+      right: 12,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(28),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+          child: Container(
+            height: 52,
+            padding: const EdgeInsets.symmetric(horizontal: 6),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.65),
+              borderRadius: BorderRadius.circular(28),
+              border: Border.all(
+                color: AppTheme.gold.withValues(alpha: 0.4),
+              ),
+            ),
+            child: Row(
+              children: [
+                _CutToolButton(
+                  icon: Icons.center_focus_strong,
+                  active: _activeTool == 'smart',
+                  onTap: () => _setCutTool('smart'),
+                  tooltip: 'Tap socket / switch',
+                ),
+                _CutToolButton(
+                  icon: Icons.gesture,
+                  active: _activeTool == 'draw',
+                  onTap: () => _setCutTool('draw'),
+                  tooltip: 'Freehand',
+                ),
+                _CutToolButton(
+                  icon: Icons.crop_square,
+                  active: _activeTool == 'rect',
+                  onTap: () => _setCutTool('rect'),
+                  tooltip: 'Rectangle',
+                ),
+                _CutToolButton(
+                  icon: Icons.circle_outlined,
+                  active: _activeTool == 'circle',
+                  onTap: () => _setCutTool('circle'),
+                  tooltip: 'Circle',
+                ),
+                Container(
+                  width: 1,
+                  height: 24,
+                  color: Colors.white24,
+                  margin: const EdgeInsets.symmetric(horizontal: 4),
+                ),
+                _CutActionButton(
+                  icon: Icons.undo,
+                  onTap: _undoLastCut,
+                  tooltip: 'Undo',
+                ),
+                _CutActionButton(
+                  icon: Icons.delete_sweep_outlined,
+                  onTap: _clearAllCuts,
+                  tooltip: 'Clear all',
+                ),
+                const Spacer(),
+                _DoneButton(onTap: _exitCutMode),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // CHANGED: Cut count chip
+  Widget _buildCutCountChip() {
+    final count = _cutCounts[_cutModeWallIndex] ?? 0;
+    if (count == 0) return const SizedBox.shrink();
+    return Positioned(
+      top: MediaQuery.of(context).padding.top + 76,
+      left: 0,
+      right: 0,
+      child: Center(
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 180),
+          child: ClipRRect(
+            key: ValueKey(count),
+            borderRadius: BorderRadius.circular(12),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.5),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: AppTheme.gold.withValues(alpha: 0.5),
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.content_cut,
+                        size: 14, color: AppTheme.gold),
+                    const SizedBox(width: 6),
+                    Text(
+                      '$count cut${count == 1 ? '' : 's'} applied',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // CHANGED: "Locked — tap to rescan" pill
+  Widget _buildLockedPill() {
+    return Positioned(
+      bottom: 184,
+      left: 0,
+      right: 0,
+      child: Center(
+        child: GestureDetector(
+          onTap: _toggleLock,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(20),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.6),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: AppTheme.gold.withValues(alpha: 0.5),
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: const [
+                    Icon(Icons.lock, size: 14, color: AppTheme.gold),
+                    SizedBox(width: 6),
+                    Text(
+                      'Locked · tap to rescan',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // CHANGED: Obstacle hint chip
+  Widget _buildObstacleHintChip() {
+    return Positioned(
+      bottom: 200,
+      left: 0,
+      right: 0,
+      child: Center(
+        child: AnimatedOpacity(
+          opacity: _obstacleHintVisible ? 1 : 0,
+          duration: const Duration(milliseconds: 250),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(14),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.55),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: AppTheme.gold.withValues(alpha: 0.4),
+                  ),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.auto_fix_high, size: 14, color: AppTheme.gold),
+                    SizedBox(width: 6),
+                    Text(
+                      'Sockets detected — open Cut Mode',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -543,7 +1002,7 @@ class _ARScreenState extends State<ARScreen>
     );
   }
 
-  // Layer 7 ───────────────────────────────────────────────────────────────
+  // Bottom bar (normal mode) ──────────────────────────────────────────────
 
   Widget _buildBottomBar() {
     final shopProvider = context.watch<ShopProvider>();
@@ -635,6 +1094,10 @@ class _ARScreenState extends State<ARScreen>
   Future<void> _onThumbnailTapped(WallpaperModel wp) async {
     final sel = _selectedWallIndex;
     if (sel != null && _walls.containsKey(sel)) {
+      // CHANGED: unlock before placing so the placement animates correctly
+      if (_wallLocked[sel] == true) {
+        await _ar.lockWall(wallIndex: sel, locked: false);
+      }
       await _placeOn(sel, wp);
     } else {
       setState(() => _pending = wp);
@@ -779,6 +1242,147 @@ class _AddToCartButtonState extends State<_AddToCartButton>
                 ),
               ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+// CHANGED: Cut Mode entry button
+class _CutModeButton extends StatelessWidget {
+  final int cutCount;
+  final VoidCallback onTap;
+  const _CutModeButton({required this.cutCount, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: AppTheme.gold,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.content_cut, size: 14, color: Colors.black),
+            const SizedBox(width: 6),
+            Text(
+              cutCount == 0 ? 'Cut' : 'Cut · $cutCount',
+              style: const TextStyle(
+                color: Colors.black,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// CHANGED: Cut tool selector pill
+class _CutToolButton extends StatelessWidget {
+  final IconData icon;
+  final bool active;
+  final VoidCallback onTap;
+  final String tooltip;
+
+  const _CutToolButton({
+    required this.icon,
+    required this.active,
+    required this.onTap,
+    required this.tooltip,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: GestureDetector(
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 160),
+          width: 44,
+          height: 40,
+          margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 6),
+          decoration: BoxDecoration(
+            color: active
+                ? AppTheme.gold
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Icon(
+            icon,
+            size: 20,
+            color: active ? Colors.black : Colors.white70,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// CHANGED: Cut undo/clear action button
+class _CutActionButton extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback onTap;
+  final String tooltip;
+
+  const _CutActionButton({
+    required this.icon,
+    required this.onTap,
+    required this.tooltip,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: GestureDetector(
+        onTap: onTap,
+        child: Container(
+          width: 40,
+          height: 40,
+          margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 6),
+          decoration: BoxDecoration(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.white24),
+          ),
+          child: Icon(icon, size: 18, color: Colors.white70),
+        ),
+      ),
+    );
+  }
+}
+
+// CHANGED: Cut mode "Done" button
+class _DoneButton extends StatelessWidget {
+  final VoidCallback onTap;
+  const _DoneButton({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        margin: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+        decoration: BoxDecoration(
+          color: AppTheme.gold,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: const Text(
+          'Done',
+          style: TextStyle(
+            color: Colors.black,
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+          ),
         ),
       ),
     );

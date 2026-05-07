@@ -5,6 +5,7 @@ import 'dart:io' show Platform;
 import 'dart:ui';
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -19,7 +20,8 @@ import '../../theme/app_theme.dart';
 
 class ARScreen extends StatefulWidget {
   /// Optional wallpaper to open the screen with.
-  /// If null, user must tap a wallpaper from bottom bar first.
+  /// If null, the screen falls back to ShopProvider.initialWallpaper, then
+  /// to user picking from the bottom bar.
   final WallpaperModel? initialWallpaper;
 
   /// Optional shop context.
@@ -48,13 +50,13 @@ class _ARScreenState extends State<ARScreen>
   // Which wallpaper is active on each wall index
   final Map<int, WallpaperModel> _wallpaperByWall = {};
 
-  // CHANGED: Cut counts per wall
+  // Cut counts per wall
   final Map<int, int> _cutCounts = {};
 
-  // CHANGED: Lock state per wall
+  // Lock state per wall
   final Map<int, bool> _wallLocked = {};
 
-  // CHANGED: Auto-lock timer per wall (cancelled on movement)
+  // Auto-lock timer per wall (cancelled on movement)
   final Map<int, Timer> _autoLockTimers = {};
 
   // Pending wallpaper — tapped in bar but not yet placed
@@ -71,15 +73,23 @@ class _ARScreenState extends State<ARScreen>
   // Preload progress
   double _preloadProgress = 0.0;
   bool _preloadDone = false;
+  bool _preloadInFlight = false;
 
-  // CHANGED: Cut mode state
+  // Cut mode state
   bool _inCutMode = false;
   String _activeTool = 'smart';
   int? _cutModeWallIndex;
 
-  // CHANGED: Obstacle hint flash
+  // Obstacle hint flash
   bool _obstacleHintVisible = false;
   Timer? _obstacleHintTimer;
+
+  // Provider listener handle so we can detach on dispose
+  VoidCallback? _shopProviderListener;
+
+  // Track which wallpaper IDs we've already preloaded so we don't
+  // re-download them every time the provider notifies.
+  final Set<String> _preloadedWallpaperIds = {};
 
   @override
   void initState() {
@@ -95,17 +105,66 @@ class _ARScreenState extends State<ARScreen>
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _currentShop = widget.initialShop ??
-        context.read<ShopProvider>().currentShop;
+    final shopProvider = context.read<ShopProvider>();
+    _currentShop = widget.initialShop ?? shopProvider.currentShop;
+
+    // Fall back to the provider's initialWallpaper. This ensures
+    // "Try in AR" buttons work even if the caller forgot to pass
+    // initialWallpaper to ARScreen().
+    _pending ??= shopProvider.initialWallpaper;
+
     if (_sub == null) {
       _boot();
     }
   }
 
   Future<void> _boot() async {
+    debugPrint('[AR] boot: starting');
     _sub = _ar.events.listen(_onAREvent);
     await _ar.initAR();
+    debugPrint('[AR] boot: native AR initialized');
 
+    if (_currentShop == null) {
+      debugPrint('[AR] boot: no current shop');
+      setState(() => _preloadDone = true);
+      return;
+    }
+
+    final shopProvider = context.read<ShopProvider>();
+
+    // CRITICAL FIX: Make sure the wallpaper listener for this shop is
+    // running. Without this, wallpapersForShop() returns an empty list
+    // and AR has nothing to preload — that's why "Preparing textures…
+    // 0%" used to hang forever.
+    debugPrint('[AR] boot: starting wallpaper listener for ${_currentShop!.id}');
+    shopProvider.startListeningToWallpapers(_currentShop!.id);
+
+    // Also start listeners for any other shops we already know about,
+    // so the bottom bar can show their wallpapers too.
+    for (final s in shopProvider.shops) {
+      shopProvider.startListeningToWallpapers(s.id);
+    }
+
+    // React to provider updates so wallpapers that arrive AFTER this
+    // screen mounts still get preloaded and shown in the bar.
+    _shopProviderListener = () {
+      if (!mounted) return;
+      _kickPreload();
+      setState(() {}); // rebuild bottom bar with newly loaded wallpapers
+    };
+    shopProvider.addListener(_shopProviderListener!);
+
+    // First-pass preload with whatever's already in the cache.
+    _kickPreload();
+  }
+
+  // Idempotent preload. Safe to call repeatedly as wallpapers stream
+  // in from Firestore. Only downloads new URLs.
+  void _kickPreload() {
+    if (_preloadInFlight) {
+      debugPrint('[AR] kickPreload: already in flight');
+      return;
+    }
     if (_currentShop == null) {
       setState(() => _preloadDone = true);
       return;
@@ -113,33 +172,100 @@ class _ARScreenState extends State<ARScreen>
 
     final shopProvider = context.read<ShopProvider>();
     final wallpapers = shopProvider.wallpapersForShop(_currentShop!.id);
+    debugPrint('[AR] kickPreload: ${wallpapers.length} wallpapers in cache for ${_currentShop!.id}');
+
+    // Empty cache no longer hangs forever — mark done so the chip
+    // dismisses. If wallpapers arrive later, this method runs again.
+    if (wallpapers.isEmpty) {
+      setState(() {
+        _preloadDone = true;
+        _preloadProgress = 1.0;
+      });
+      return;
+    }
+
+    // Filter out wallpapers we've already preloaded
+    final newWallpapers = wallpapers
+        .where((w) => !_preloadedWallpaperIds.contains(w.id))
+        .toList();
+    if (newWallpapers.isEmpty) {
+      debugPrint('[AR] kickPreload: nothing new');
+      setState(() {
+        _preloadDone = true;
+        _preloadProgress = 1.0;
+      });
+      return;
+    }
 
     final urls = <String>[];
-    for (final w in wallpapers) {
+    for (final w in newWallpapers) {
       if (w.pbr.albedoUrl.isNotEmpty) urls.add(w.pbr.albedoUrl);
       if (w.pbr.normalUrl.isNotEmpty) urls.add(w.pbr.normalUrl);
       if (w.pbr.roughnessUrl.isNotEmpty) urls.add(w.pbr.roughnessUrl);
       if (w.pbr.aoUrl.isNotEmpty) urls.add(w.pbr.aoUrl);
+      // Include thumbnail too so the bottom bar shows fast
+      final thumb = w.thumbnailUrl;
+      if (thumb != null && thumb.isNotEmpty) urls.add(thumb);
     }
 
-    if (!mounted) return;
+    if (urls.isEmpty) {
+      debugPrint('[AR] kickPreload: wallpapers exist but no URLs');
+      for (final w in newWallpapers) {
+        _preloadedWallpaperIds.add(w.id);
+      }
+      setState(() {
+        _preloadDone = true;
+        _preloadProgress = 1.0;
+      });
+      return;
+    }
 
-    unawaited(_cache.preloadShopTextures(
-      textureUrls: urls,
-      onProgress: (p) {
-        if (!mounted) return;
-        setState(() {
-          _preloadProgress = p;
-          _preloadDone = p >= 1.0;
-        });
-      },
-    ));
+    debugPrint('[AR] kickPreload: downloading ${urls.length} URLs');
+    _preloadInFlight = true;
+    setState(() {
+      _preloadDone = false;
+      _preloadProgress = 0.0;
+    });
+
+    unawaited(
+      _cache
+          .preloadShopTextures(
+        textureUrls: urls,
+        onProgress: (p) {
+          if (!mounted) return;
+          setState(() {
+            _preloadProgress = p;
+            _preloadDone = p >= 1.0;
+          });
+        },
+      )
+          .then((_) {
+        _preloadInFlight = false;
+        for (final w in newWallpapers) {
+          _preloadedWallpaperIds.add(w.id);
+        }
+        debugPrint('[AR] kickPreload: complete');
+      }).catchError((e) {
+        _preloadInFlight = false;
+        debugPrint('[AR] kickPreload error: $e');
+        if (mounted) {
+          setState(() => _preloadDone = true);
+        }
+      }),
+    );
   }
 
   @override
   void dispose() {
     _scanCtrl.dispose();
     _sub?.cancel();
+    if (_shopProviderListener != null) {
+      try {
+        context.read<ShopProvider>().removeListener(_shopProviderListener!);
+      } catch (_) {
+        // context may already be unmounted
+      }
+    }
     for (final t in _autoLockTimers.values) {
       t.cancel();
     }
@@ -152,6 +278,7 @@ class _ARScreenState extends State<ARScreen>
   // ── Native event handling ───────────────────────────────────────────────
 
   Future<void> _onAREvent(AREvent e) async {
+    debugPrint('[AR] event: ${e.type} data=${e.data}');
     switch (e.type) {
       case 'wallDetected':
         final idx = e.wallIndex;
@@ -181,7 +308,6 @@ class _ARScreenState extends State<ARScreen>
             sqm: e.sqm ?? (e.width! * e.height!),
           );
         });
-        // CHANGED: Wall is moving → cancel auto-lock if pending
         _autoLockTimers[idx]?.cancel();
         if (_wallpaperByWall[idx] != null && _wallLocked[idx] != true) {
           _scheduleAutoLock(idx);
@@ -195,20 +321,17 @@ class _ARScreenState extends State<ARScreen>
         break;
 
       case 'wallpaperPlaced':
-        // CHANGED: Schedule auto-lock after placement
         final idx = e.wallIndex;
         if (idx != null) {
           _scheduleAutoLock(idx);
         }
         break;
 
-      // CHANGED: Cut mode events ─────────────────────────────────────────
       case 'cutUpdate':
         final idx = e.wallIndex;
         final count = e.cutCount;
         if (idx == null || count == null) return;
         setState(() => _cutCounts[idx] = count);
-        // Light haptic feedback
         HapticFeedback.lightImpact();
         break;
 
@@ -225,7 +348,6 @@ class _ARScreenState extends State<ARScreen>
         });
         break;
 
-      // CHANGED: Lock events ─────────────────────────────────────────────
       case 'wallLockChanged':
         final idx = e.wallIndex;
         final locked = e.data['locked'] as bool?;
@@ -233,12 +355,10 @@ class _ARScreenState extends State<ARScreen>
         setState(() => _wallLocked[idx] = locked);
         break;
 
-      // CHANGED: Vision hint
       case 'obstacleHint':
         _showObstacleHint();
         break;
 
-      // CHANGED: Session lifecycle
       case 'sessionInterrupted':
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -277,7 +397,6 @@ class _ARScreenState extends State<ARScreen>
     }
   }
 
-  // CHANGED: Auto-lock after 1.5s of no plane updates
   void _scheduleAutoLock(int wallIndex) {
     _autoLockTimers[wallIndex]?.cancel();
     _autoLockTimers[wallIndex] = Timer(
@@ -288,9 +407,7 @@ class _ARScreenState extends State<ARScreen>
         if (_wallLocked[wallIndex] == true) return;
         try {
           await _ar.lockWall(wallIndex: wallIndex, locked: true);
-        } catch (_) {
-          // ignore
-        }
+        } catch (_) {}
       },
     );
   }
@@ -306,6 +423,7 @@ class _ARScreenState extends State<ARScreen>
   }
 
   Future<void> _placeOn(int wallIndex, WallpaperModel wallpaper) async {
+    debugPrint('[AR] placeOn $wallIndex with ${wallpaper.name}');
     try {
       final alreadyPlaced = _wallpaperByWall[wallIndex] != null;
       if (alreadyPlaced) {
@@ -326,6 +444,7 @@ class _ARScreenState extends State<ARScreen>
         _pending = null;
       });
     } on PlatformException catch (e) {
+      debugPrint('[AR] placeOn error: ${e.code} ${e.message}');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -336,11 +455,10 @@ class _ARScreenState extends State<ARScreen>
     }
   }
 
-  // CHANGED: Cut-mode controls
+  // Cut-mode controls
   Future<void> _enterCutMode() async {
     final idx = _selectedWallIndex;
     if (idx == null || _wallpaperByWall[idx] == null) return;
-    // Unlock wall first so user can position cuts naturally
     if (_wallLocked[idx] == true) {
       await _ar.lockWall(wallIndex: idx, locked: false);
     }
@@ -456,8 +574,6 @@ class _ARScreenState extends State<ARScreen>
     return _wallLocked[idx] == true && _wallpaperByWall[idx] != null;
   }
 
-  // Layer 1 ───────────────────────────────────────────────────────────────
-
   Widget _buildNativeARView() {
     const viewType = 'com.oboia/ar_view';
     const Map<String, dynamic> creationParams = <String, dynamic>{};
@@ -485,8 +601,6 @@ class _ARScreenState extends State<ARScreen>
       ),
     );
   }
-
-  // Scanning overlay ──────────────────────────────────────────────────────
 
   Widget _buildScanningOverlay() {
     return IgnorePointer(
@@ -527,13 +641,12 @@ class _ARScreenState extends State<ARScreen>
     );
   }
 
-  // Measurements card with Cut Mode FAB ───────────────────────────────────
-
   Widget _buildMeasurementsCard() {
     final m = _walls[_selectedWallIndex];
     if (m == null) return const SizedBox.shrink();
 
     final wallpaper = _wallpaperByWall[_selectedWallIndex] ??
+        _pending ??
         widget.initialWallpaper;
     if (wallpaper == null) return const SizedBox.shrink();
 
@@ -600,11 +713,11 @@ class _ARScreenState extends State<ARScreen>
                       ),
                     ),
                     const Spacer(),
-                    // CHANGED: Cut mode FAB
-                    if (hasWallpaperPlaced) _CutModeButton(
-                      cutCount: cutCount,
-                      onTap: _enterCutMode,
-                    ),
+                    if (hasWallpaperPlaced)
+                      _CutModeButton(
+                        cutCount: cutCount,
+                        onTap: _enterCutMode,
+                      ),
                   ],
                 ),
               ],
@@ -640,8 +753,6 @@ class _ARScreenState extends State<ARScreen>
     }
     return b.toString();
   }
-
-  // Wall selector ─────────────────────────────────────────────────────────
 
   Widget _buildWallSelector() {
     final indices = _walls.keys.toList()..sort();
@@ -686,7 +797,6 @@ class _ARScreenState extends State<ARScreen>
                           fontSize: 12,
                         ),
                       ),
-                      // CHANGED: Lock icon next to wall number
                       if (_wallLocked[i] == true) ...[
                         const SizedBox(width: 4),
                         Icon(
@@ -706,8 +816,6 @@ class _ARScreenState extends State<ARScreen>
       ),
     );
   }
-
-  // Top bar (normal mode) ─────────────────────────────────────────────────
 
   Widget _buildTopBar() {
     final cart = context.watch<CartProvider>();
@@ -733,8 +841,6 @@ class _ARScreenState extends State<ARScreen>
       ),
     );
   }
-
-  // CHANGED: Top bar (cut mode) ───────────────────────────────────────────
 
   Widget _buildCutModeTopBar() {
     return Positioned(
@@ -807,7 +913,6 @@ class _ARScreenState extends State<ARScreen>
     );
   }
 
-  // CHANGED: Cut count chip
   Widget _buildCutCountChip() {
     final count = _cutCounts[_cutModeWallIndex] ?? 0;
     if (count == 0) return const SizedBox.shrink();
@@ -859,7 +964,6 @@ class _ARScreenState extends State<ARScreen>
     );
   }
 
-  // CHANGED: "Locked — tap to rescan" pill
   Widget _buildLockedPill() {
     return Positioned(
       bottom: 184,
@@ -907,7 +1011,6 @@ class _ARScreenState extends State<ARScreen>
     );
   }
 
-  // CHANGED: Obstacle hint chip
   Widget _buildObstacleHintChip() {
     return Positioned(
       bottom: 200,
@@ -968,7 +1071,8 @@ class _ARScreenState extends State<ARScreen>
     }
 
     final m = _walls[sel]!;
-    final wp = _wallpaperByWall[sel] ?? widget.initialWallpaper;
+    final wp =
+        _wallpaperByWall[sel] ?? _pending ?? widget.initialWallpaper;
 
     if (wp == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1001,8 +1105,6 @@ class _ARScreenState extends State<ARScreen>
       ),
     );
   }
-
-  // Bottom bar (normal mode) ──────────────────────────────────────────────
 
   Widget _buildBottomBar() {
     final shopProvider = context.watch<ShopProvider>();
@@ -1074,18 +1176,36 @@ class _ARScreenState extends State<ARScreen>
             ),
           ),
           const SizedBox(height: 8),
-          Row(
-            children: [
-              for (final wp in wallpapers) ...[
-                _Thumbnail(
-                  wallpaper: wp,
-                  isActive: wp.id == activeId,
-                  onTap: () => _onThumbnailTapped(wp),
+          if (wallpapers.isEmpty)
+            Container(
+              width: 120,
+              height: 72,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.04),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.08),
                 ),
-                const SizedBox(width: 8),
+              ),
+              child: const Text(
+                'No wallpapers',
+                style: TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+            )
+          else
+            Row(
+              children: [
+                for (final wp in wallpapers) ...[
+                  _Thumbnail(
+                    wallpaper: wp,
+                    isActive: wp.id == activeId,
+                    onTap: () => _onThumbnailTapped(wp),
+                  ),
+                  const SizedBox(width: 8),
+                ],
               ],
-            ],
-          ),
+            ),
         ],
       ),
     );
@@ -1094,7 +1214,6 @@ class _ARScreenState extends State<ARScreen>
   Future<void> _onThumbnailTapped(WallpaperModel wp) async {
     final sel = _selectedWallIndex;
     if (sel != null && _walls.containsKey(sel)) {
-      // CHANGED: unlock before placing so the placement animates correctly
       if (_wallLocked[sel] == true) {
         await _ar.lockWall(wallIndex: sel, locked: false);
       }
@@ -1248,7 +1367,6 @@ class _AddToCartButtonState extends State<_AddToCartButton>
   }
 }
 
-// CHANGED: Cut Mode entry button
 class _CutModeButton extends StatelessWidget {
   final int cutCount;
   final VoidCallback onTap;
@@ -1284,7 +1402,6 @@ class _CutModeButton extends StatelessWidget {
   }
 }
 
-// CHANGED: Cut tool selector pill
 class _CutToolButton extends StatelessWidget {
   final IconData icon;
   final bool active;
@@ -1310,9 +1427,7 @@ class _CutToolButton extends StatelessWidget {
           height: 40,
           margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 6),
           decoration: BoxDecoration(
-            color: active
-                ? AppTheme.gold
-                : Colors.transparent,
+            color: active ? AppTheme.gold : Colors.transparent,
             borderRadius: BorderRadius.circular(12),
           ),
           child: Icon(
@@ -1326,7 +1441,6 @@ class _CutToolButton extends StatelessWidget {
   }
 }
 
-// CHANGED: Cut undo/clear action button
 class _CutActionButton extends StatelessWidget {
   final IconData icon;
   final VoidCallback onTap;
@@ -1360,7 +1474,6 @@ class _CutActionButton extends StatelessWidget {
   }
 }
 
-// CHANGED: Cut mode "Done" button
 class _DoneButton extends StatelessWidget {
   final VoidCallback onTap;
   const _DoneButton({required this.onTap});
@@ -1413,9 +1526,7 @@ class _Thumbnail extends StatelessWidget {
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(12),
             border: Border.all(
-              color: isActive
-                  ? AppTheme.gold
-                  : Colors.transparent,
+              color: isActive ? AppTheme.gold : Colors.transparent,
               width: 2,
             ),
           ),
@@ -1426,8 +1537,7 @@ class _Thumbnail extends StatelessWidget {
                 : CachedNetworkImage(
                     imageUrl: thumbUrl,
                     fit: BoxFit.cover,
-                    placeholder: (_, __) =>
-                        const _ShimmerTile(),
+                    placeholder: (_, __) => const _ShimmerTile(),
                     errorWidget: (_, __, ___) => Container(
                       color: Colors.black38,
                       child: const Icon(
@@ -1547,56 +1657,27 @@ class _DashedPainter extends CustomPainter {
       }
     }
 
-    // Corner brackets
     final bracket = Paint()
       ..color = color
       ..style = PaintingStyle.stroke
       ..strokeWidth = 4
       ..strokeCap = StrokeCap.round;
     const len = 22.0;
+    canvas.drawLine(const Offset(0, 0), const Offset(len, 0), bracket);
+    canvas.drawLine(const Offset(0, 0), const Offset(0, len), bracket);
     canvas.drawLine(
-      const Offset(0, 0),
-      const Offset(len, 0),
-      bracket,
-    );
+        Offset(size.width, 0), Offset(size.width - len, 0), bracket);
+    canvas.drawLine(Offset(size.width, 0), Offset(size.width, len), bracket);
     canvas.drawLine(
-      const Offset(0, 0),
-      const Offset(0, len),
-      bracket,
-    );
+        Offset(0, size.height), Offset(len, size.height), bracket);
     canvas.drawLine(
-      Offset(size.width, 0),
-      Offset(size.width - len, 0),
-      bracket,
-    );
-    canvas.drawLine(
-      Offset(size.width, 0),
-      Offset(size.width, len),
-      bracket,
-    );
-    canvas.drawLine(
-      Offset(0, size.height),
-      Offset(len, size.height),
-      bracket,
-    );
-    canvas.drawLine(
-      Offset(0, size.height),
-      Offset(0, size.height - len),
-      bracket,
-    );
-    canvas.drawLine(
-      Offset(size.width, size.height),
-      Offset(size.width - len, size.height),
-      bracket,
-    );
-    canvas.drawLine(
-      Offset(size.width, size.height),
-      Offset(size.width, size.height - len),
-      bracket,
-    );
+        Offset(0, size.height), Offset(0, size.height - len), bracket);
+    canvas.drawLine(Offset(size.width, size.height),
+        Offset(size.width - len, size.height), bracket);
+    canvas.drawLine(Offset(size.width, size.height),
+        Offset(size.width, size.height - len), bracket);
   }
 
   @override
-  bool shouldRepaint(covariant _DashedPainter old) =>
-      old.color != color;
+  bool shouldRepaint(covariant _DashedPainter old) => old.color != color;
 }

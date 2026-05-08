@@ -92,6 +92,16 @@ class _ARScreenState extends State<ARScreen>
   // re-download them every time the provider notifies.
   final Set<String> _preloadedWallpaperIds = {};
 
+  // CHANGED: Manual mode state ─────────────────────────────────────────────
+  /// True while native manual-corner overlay is shown
+  bool _inManualMode = false;
+
+  /// True when native has emitted suggestManual and we haven't resolved it yet
+  bool _showManualSuggestion = false;
+
+  /// 0..4 — how many corners the user has captured
+  int _manualCornerCount = 0;
+
   @override
   void initState() {
     super.initState();
@@ -109,9 +119,6 @@ class _ARScreenState extends State<ARScreen>
     final shopProvider = context.read<ShopProvider>();
     _currentShop = widget.initialShop ?? shopProvider.currentShop;
 
-    // Fall back to the provider's initialWallpaper. This ensures
-    // "Try in AR" buttons work even if the caller forgot to pass
-    // initialWallpaper to ARScreen().
     _pending ??= shopProvider.initialWallpaper;
 
     if (_sub == null) {
@@ -119,7 +126,6 @@ class _ARScreenState extends State<ARScreen>
     }
   }
 
-  // ── CHANGED: _boot replaced with richer debug prints + fallback retry ──
   Future<void> _boot() async {
     debugPrint('[AR] boot: starting');
     _sub = _ar.events.listen(_onAREvent);
@@ -146,22 +152,17 @@ class _ARScreenState extends State<ARScreen>
 
     _pending ??= shopProvider.initialWallpaper;
 
-    // React to provider updates so wallpapers that arrive AFTER this
-    // screen mounts still get preloaded and shown in the bar.
     _shopProviderListener = () {
       if (!mounted) return;
       debugPrint('[AR] provider notified — kicking preload');
       _kickPreload();
-      setState(() {}); // rebuild bottom bar with newly loaded wallpapers
+      setState(() {});
     };
     shopProvider.addListener(_shopProviderListener!);
 
-    // First-pass preload with whatever's already in the cache.
     _kickPreload();
     debugPrint('[AR] boot: first kickPreload done');
 
-    // Fallback: if wallpapers arrive async and notifyListeners()
-    // was missed, retry after 2 seconds
     Future.delayed(const Duration(seconds: 2), () {
       if (!mounted) return;
       debugPrint('[AR] fallback retry: kicking preload again');
@@ -169,15 +170,13 @@ class _ARScreenState extends State<ARScreen>
     });
   }
 
-  // Idempotent preload. Safe to call repeatedly as wallpapers stream
-  // in from Firestore. Only downloads new URLs.
   void _kickPreload() {
     if (_preloadInFlight) {
       debugPrint('[AR] kickPreload: already in flight');
       return;
     }
-    // CHANGED: diagnostic print to see shop + wallpaper count on every call
-    debugPrint('[AR] kickPreload: shop=${_currentShop?.id}, wallpapers=${context.read<ShopProvider>().wallpapersForShop(_currentShop?.id ?? "").length}');
+    debugPrint(
+        '[AR] kickPreload: shop=${_currentShop?.id}, wallpapers=${context.read<ShopProvider>().wallpapersForShop(_currentShop?.id ?? "").length}');
     if (_currentShop == null) {
       setState(() => _preloadDone = true);
       return;
@@ -185,10 +184,9 @@ class _ARScreenState extends State<ARScreen>
 
     final shopProvider = context.read<ShopProvider>();
     final wallpapers = shopProvider.wallpapersForShop(_currentShop!.id);
-    debugPrint('[AR] kickPreload: ${wallpapers.length} wallpapers in cache for ${_currentShop!.id}');
+    debugPrint(
+        '[AR] kickPreload: ${wallpapers.length} wallpapers in cache for ${_currentShop!.id}');
 
-    // Empty cache no longer hangs forever — mark done so the chip
-    // dismisses. If wallpapers arrive later, this method runs again.
     if (wallpapers.isEmpty) {
       setState(() {
         _preloadDone = true;
@@ -197,7 +195,6 @@ class _ARScreenState extends State<ARScreen>
       return;
     }
 
-    // Filter out wallpapers we've already preloaded
     final newWallpapers = wallpapers
         .where((w) => !_preloadedWallpaperIds.contains(w.id))
         .toList();
@@ -216,7 +213,6 @@ class _ARScreenState extends State<ARScreen>
       if (w.pbr.normalUrl.isNotEmpty) urls.add(w.pbr.normalUrl);
       if (w.pbr.roughnessUrl.isNotEmpty) urls.add(w.pbr.roughnessUrl);
       if (w.pbr.aoUrl.isNotEmpty) urls.add(w.pbr.aoUrl);
-      // Include thumbnail too so the bottom bar shows fast
       final thumb = w.thumbnailUrl;
       if (thumb != null && thumb.isNotEmpty) urls.add(thumb);
     }
@@ -275,9 +271,7 @@ class _ARScreenState extends State<ARScreen>
     if (_shopProviderListener != null) {
       try {
         context.read<ShopProvider>().removeListener(_shopProviderListener!);
-      } catch (_) {
-        // context may already be unmounted
-      }
+      } catch (_) {}
     }
     for (final t in _autoLockTimers.values) {
       t.cancel();
@@ -304,6 +298,9 @@ class _ARScreenState extends State<ARScreen>
             sqm: e.sqm ?? (e.width! * e.height!),
           );
           _selectedWallIndex ??= idx;
+          // Once any wall is detected (auto OR manual), the suggestion dialog
+          // is no longer relevant.
+          _showManualSuggestion = false;
         });
         if (_pending != null && _wallpaperByWall[idx] == null) {
           await _placeOn(idx, _pending!);
@@ -396,6 +393,67 @@ class _ARScreenState extends State<ARScreen>
         }
         break;
 
+      // ── CHANGED: Manual mode events ──────────────────────────────────────
+      case 'suggestManual':
+        // Only show the dialog if no walls have been detected yet AND
+        // we're not already in manual mode.
+        if (_walls.isEmpty && !_inManualMode) {
+          setState(() => _showManualSuggestion = true);
+          HapticFeedback.lightImpact();
+        }
+        break;
+
+      case 'manualModeEntered':
+        setState(() {
+          _inManualMode = true;
+          _manualCornerCount = 0;
+          _showManualSuggestion = false;
+        });
+        break;
+
+      case 'manualModeExited':
+        setState(() {
+          _inManualMode = false;
+          _manualCornerCount = 0;
+        });
+        break;
+
+      case 'manualCornerAdded':
+        final n = e.cornerNumber;
+        if (n == null) return;
+        setState(() => _manualCornerCount = n);
+        HapticFeedback.lightImpact();
+        break;
+
+      case 'manualReset':
+        setState(() => _manualCornerCount = 0);
+        break;
+
+      case 'manualWallFailed':
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                e.reason ?? 'Try tapping closer to the wall',
+              ),
+              backgroundColor: Colors.black87,
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        }
+        HapticFeedback.heavyImpact();
+        break;
+
+      case 'manualWallReady':
+        // Native also emits wallDetected which the existing handler above
+        // will pick up. Just clear the manual UI state here.
+        setState(() {
+          _inManualMode = false;
+          _manualCornerCount = 0;
+        });
+        HapticFeedback.mediumImpact();
+        break;
+
       case 'error':
         final msg = e.errorMessage ?? 'AR error';
         if (mounted) {
@@ -465,6 +523,44 @@ class _ARScreenState extends State<ARScreen>
           backgroundColor: Colors.red.shade900,
         ),
       );
+    }
+  }
+
+  // CHANGED: Manual mode controls ────────────────────────────────────────
+  Future<void> _enterManualMode() async {
+    HapticFeedback.lightImpact();
+    setState(() => _showManualSuggestion = false);
+    try {
+      await _ar.enterManualMode();
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(e.message ?? 'Could not enter manual mode')),
+      );
+    }
+  }
+
+  Future<void> _exitManualMode() async {
+    try {
+      await _ar.exitManualMode();
+    } catch (_) {}
+    setState(() {
+      _inManualMode = false;
+      _manualCornerCount = 0;
+    });
+  }
+
+  void _dismissManualSuggestion() {
+    setState(() => _showManualSuggestion = false);
+  }
+
+  Future<void> _handleBack() async {
+    if (_inManualMode) {
+      await _exitManualMode();
+      return;
+    }
+    if (mounted) {
+      Navigator.of(context).maybePop();
     }
   }
 
@@ -558,32 +654,78 @@ class _ARScreenState extends State<ARScreen>
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          _buildNativeARView(),
-          if (_walls.isEmpty && !_inCutMode) _buildScanningOverlay(),
-          if (!_inCutMode) _buildTopBar(),
-          if (_inCutMode) _buildCutModeTopBar(),
-          if (_walls.length > 1 && !_inCutMode) _buildWallSelector(),
-          if (_selectedWallIndex != null && _walls.isNotEmpty && !_inCutMode)
-            _buildMeasurementsCard(),
-          if (_inCutMode) _buildCutCountChip(),
-          if (!_inCutMode) _buildBottomBar(),
-          if (!_preloadDone && !_inCutMode) _buildPreloadChip(),
-          if (_obstacleHintVisible && !_inCutMode) _buildObstacleHintChip(),
-          if (_isLockedAndIdle()) _buildLockedPill(),
-          // CHANGED: Debug overlay — only filters [AR] tag for clarity
-          const DebugOverlay(filter: '[AR]'),
-        ],
+    return PopScope(
+      canPop: !_inManualMode,
+      onPopInvokedWithResult: (didPop, _) async {
+        if (!didPop && _inManualMode) {
+          await _exitManualMode();
+        }
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            _buildNativeARView(),
+
+            // Scanning overlay only shown when:
+            //  - no walls detected yet
+            //  - not in cut mode
+            //  - not in manual mode (native overlay handles that)
+            if (_walls.isEmpty && !_inCutMode && !_inManualMode)
+              _buildScanningOverlay(),
+
+            // Top bar shown except in cut mode
+            if (!_inCutMode) _buildTopBar(),
+            if (_inCutMode) _buildCutModeTopBar(),
+
+            // Wall selector only shown when not in cut/manual mode
+            if (_walls.length > 1 && !_inCutMode && !_inManualMode)
+              _buildWallSelector(),
+
+            // Measurements card only when a wall exists & not in special modes
+            if (_selectedWallIndex != null &&
+                _walls.isNotEmpty &&
+                !_inCutMode &&
+                !_inManualMode)
+              _buildMeasurementsCard(),
+
+            if (_inCutMode) _buildCutCountChip(),
+
+            // Bottom wallpaper bar — hidden in cut & manual modes
+            if (!_inCutMode && !_inManualMode) _buildBottomBar(),
+
+            if (!_preloadDone && !_inCutMode && !_inManualMode)
+              _buildPreloadChip(),
+
+            if (_obstacleHintVisible && !_inCutMode && !_inManualMode)
+              _buildObstacleHintChip(),
+
+            if (_isLockedAndIdle()) _buildLockedPill(),
+
+            // CHANGED: "Mark wall manually" pill in scanning overlay
+            if (_walls.isEmpty &&
+                !_inCutMode &&
+                !_inManualMode &&
+                !_showManualSuggestion)
+              _buildManualEntryButton(),
+
+            // CHANGED: Friendly suggestion dialog when auto-detect fails
+            if (_showManualSuggestion &&
+                _walls.isEmpty &&
+                !_inCutMode &&
+                !_inManualMode)
+              _buildManualSuggestionDialog(),
+
+            const DebugOverlay(filter: '[AR]'),
+          ],
+        ),
       ),
     );
   }
 
   bool _isLockedAndIdle() {
-    if (_inCutMode) return false;
+    if (_inCutMode || _inManualMode) return false;
     final idx = _selectedWallIndex;
     if (idx == null) return false;
     return _wallLocked[idx] == true && _wallpaperByWall[idx] != null;
@@ -651,6 +793,190 @@ class _ARScreenState extends State<ARScreen>
               ),
             );
           },
+        ),
+      ),
+    );
+  }
+
+  // CHANGED: Always-available "Mark manually" pill near bottom of scanning view
+  Widget _buildManualEntryButton() {
+    return Positioned(
+      bottom: MediaQuery.of(context).padding.bottom + 200,
+      left: 0,
+      right: 0,
+      child: Center(
+        child: GestureDetector(
+          onTap: _enterManualMode,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(22),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 18,
+                  vertical: 12,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.55),
+                  borderRadius: BorderRadius.circular(22),
+                  border: Border.all(
+                    color: AppTheme.gold.withValues(alpha: 0.5),
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.4),
+                      blurRadius: 14,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: const [
+                    Icon(Icons.touch_app, size: 16, color: AppTheme.gold),
+                    SizedBox(width: 8),
+                    Text(
+                      'Mark wall manually',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // CHANGED: Friendly auto-suggestion dialog after 5s of failed detection
+  Widget _buildManualSuggestionDialog() {
+    return Positioned(
+      bottom: MediaQuery.of(context).padding.bottom + 180,
+      left: 24,
+      right: 24,
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 360),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(20),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(20, 18, 20, 16),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.7),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: AppTheme.gold.withValues(alpha: 0.6),
+                    width: 1.4,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.5),
+                      blurRadius: 20,
+                      offset: const Offset(0, 6),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    const Icon(
+                      Icons.lightbulb_outline,
+                      color: AppTheme.gold,
+                      size: 28,
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Plain wall?',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    const Text(
+                      'Mark the corners by tapping — works on any wall, even blank ones.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w400,
+                        height: 1.35,
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        GestureDetector(
+                          onTap: _dismissManualSuggestion,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 9,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.transparent,
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(
+                                color: Colors.white.withValues(alpha: 0.25),
+                              ),
+                            ),
+                            child: const Text(
+                              'Keep trying',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        GestureDetector(
+                          onTap: _enterManualMode,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 16,
+                              vertical: 9,
+                            ),
+                            decoration: BoxDecoration(
+                              color: AppTheme.gold,
+                              borderRadius: BorderRadius.circular(14),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: AppTheme.gold
+                                      .withValues(alpha: 0.4),
+                                  blurRadius: 12,
+                                  offset: const Offset(0, 3),
+                                ),
+                              ],
+                            ),
+                            child: const Text(
+                              'Mark manually',
+                              style: TextStyle(
+                                color: Colors.black,
+                                fontSize: 13,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
         ),
       ),
     );
@@ -846,12 +1172,14 @@ class _ARScreenState extends State<ARScreen>
               backgroundColor: Colors.black54,
               child: Icon(Icons.arrow_back, color: Colors.white),
             ),
-            onPressed: () => Navigator.of(context).maybePop(),
+            onPressed: _handleBack,
           ),
-          _AddToCartButton(
-            count: cart.totalItems,
-            onTap: _addCurrentToCart,
-          ),
+          // Cart hidden in manual mode (the screen is for tapping corners)
+          if (!_inManualMode)
+            _AddToCartButton(
+              count: cart.totalItems,
+              onTap: _addCurrentToCart,
+            ),
         ],
       ),
     );

@@ -15,6 +15,12 @@
 		97C146FC1CF9000F007C117D /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FA1CF9000F007C117D /* Main.storyboard */; };
 		97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FD1CF9000F007C117D /* Assets.xcassets */; };
 		97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */; };
+		AAAA0001000000000000A001 /* ARWallpaperView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBBB0001000000000000B001 /* ARWallpaperView.swift */; };
+		AAAA0002000000000000A002 /* ARWallpaperViewFactory.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBBB0002000000000000B002 /* ARWallpaperViewFactory.swift */; };
+		AAAA0003000000000000A003 /* CutModeOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBBB0003000000000000B003 /* CutModeOverlay.swift */; };
+		AAAA0004000000000000A004 /* ManualWallSelector.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBBB0004000000000000B004 /* ManualWallSelector.swift */; };
+		AAAA0005000000000000A005 /* TextureCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBBB0005000000000000B005 /* TextureCache.swift */; };
+		AAAA0006000000000000A006 /* WallpaperCutTool.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBBB0006000000000000B006 /* WallpaperCutTool.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -57,6 +63,12 @@
 		97C146FD1CF9000F007C117D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		97C147001CF9000F007C117D /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		97C147021CF9000F007C117D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		BBBB0001000000000000B001 /* ARWallpaperView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARWallpaperView.swift; sourceTree = "<group>"; };
+		BBBB0002000000000000B002 /* ARWallpaperViewFactory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARWallpaperViewFactory.swift; sourceTree = "<group>"; };
+		BBBB0003000000000000B003 /* CutModeOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CutModeOverlay.swift; sourceTree = "<group>"; };
+		BBBB0004000000000000B004 /* ManualWallSelector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManualWallSelector.swift; sourceTree = "<group>"; };
+		BBBB0005000000000000B005 /* TextureCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextureCache.swift; sourceTree = "<group>"; };
+		BBBB0006000000000000B006 /* WallpaperCutTool.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperCutTool.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -120,6 +132,12 @@
 				74858FAE1ED2DC5600515810 /* AppDelegate.swift */,
 				7884E8672EC3CC0400C636F2 /* SceneDelegate.swift */,
 				74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */,
+				BBBB0001000000000000B001 /* ARWallpaperView.swift */,
+				BBBB0002000000000000B002 /* ARWallpaperViewFactory.swift */,
+				BBBB0003000000000000B003 /* CutModeOverlay.swift */,
+				BBBB0004000000000000B004 /* ManualWallSelector.swift */,
+				BBBB0005000000000000B005 /* TextureCache.swift */,
+				BBBB0006000000000000B006 /* WallpaperCutTool.swift */,
 			);
 			path = Runner;
 			sourceTree = "<group>";
@@ -274,6 +292,12 @@
 				74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */,
 				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
 				7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */,
+				AAAA0001000000000000A001 /* ARWallpaperView.swift in Sources */,
+				AAAA0002000000000000A002 /* ARWallpaperViewFactory.swift in Sources */,
+				AAAA0003000000000000A003 /* CutModeOverlay.swift in Sources */,
+				AAAA0004000000000000A004 /* ManualWallSelector.swift in Sources */,
+				AAAA0005000000000000A005 /* TextureCache.swift in Sources */,
+				AAAA0006000000000000A006 /* WallpaperCutTool.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

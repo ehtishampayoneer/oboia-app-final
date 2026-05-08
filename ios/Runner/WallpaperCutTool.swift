@@ -57,7 +57,7 @@ class WallpaperCutTool {
     private let maskWidth  = 2048
     private let maskHeight = 2048
     private let featherBlur: CGFloat     = 10.0
-    private let coreInsetRatio: CGFloat  = 0.15   // restamp core at this inset fraction
+    private let coreInsetRatio: CGFloat  = 0.15
     private let shadowRingWidth: CGFloat = 6.0
     private let shadowOffset = CGSize(width: 1.5, height: 2.0)
     private let shadowGray: CGFloat      = 0.12
@@ -139,9 +139,9 @@ class WallpaperCutTool {
                     self.addRectangleCut(uvRect: padded, toWall: wallId)
                     completion(true)
                 } else {
-                    // Fallback: ~8cm square at tap point
-                    let w = wallData.anchor.planeExtent.width
-                    let h = wallData.anchor.planeExtent.height
+                    // CHANGED: use wallData.width/height (works for both auto & manual walls)
+                    let w = wallData.width
+                    let h = wallData.height
                     let uSize = CGFloat(w > 0 ? 0.08 / w : 0.05)
                     let vSize = CGFloat(h > 0 ? 0.08 / h : 0.05)
                     let fallback = CGRect(
@@ -296,9 +296,15 @@ class WallpaperCutTool {
         sceneView: ARSCNView,
         wallData: WallData
     ) -> CGPoint? {
+        // CHANGED: For manual walls, raycast against estimated planes too
+        // (manual walls don't have ARKit-tracked planes)
+        let allowing: ARRaycastQuery.Target = wallData.isManual
+            ? .estimatedPlane
+            : .existingPlaneGeometry
+
         guard let q = sceneView.raycastQuery(
             from: screenPoint,
-            allowing: .existingPlaneGeometry,
+            allowing: allowing,
             alignment: .vertical
         ) else { return nil }
 
@@ -314,11 +320,33 @@ class WallpaperCutTool {
     }
 
     func worldPositionToWallUV(worldPos: SIMD3<Float>, wallData: WallData) -> CGPoint? {
-        let anchor = wallData.anchor
+        // CHANGED: Branch by wall type — auto walls use anchor.transform,
+        // manual walls compute a transform from manualCenter + manualNormal.
+
+        if wallData.isManual {
+            return manualWallUV(worldPos: worldPos, wallData: wallData)
+        } else {
+            return autoWallUV(worldPos: worldPos, wallData: wallData)
+        }
+    }
+
+    /// Auto-detected wall: use the ARKit plane anchor's transform.
+    private func autoWallUV(worldPos: SIMD3<Float>, wallData: WallData) -> CGPoint? {
+        guard let anchor = wallData.anchor else { return nil }
+
         let invTx  = simd_inverse(anchor.transform)
         let local  = invTx * SIMD4<Float>(worldPos.x, worldPos.y, worldPos.z, 1.0)
-        let pw = anchor.planeExtent.width
-        let ph = anchor.planeExtent.height
+
+        // CHANGED: gracefully fall back to extent on iOS < 16
+        let pw: Float
+        let ph: Float
+        if #available(iOS 16.0, *) {
+            pw = anchor.planeExtent.width
+            ph = anchor.planeExtent.height
+        } else {
+            pw = anchor.extent.x
+            ph = anchor.extent.z
+        }
         guard pw > 0.01, ph > 0.01 else { return nil }
 
         // Vertical plane: x = horizontal, y = vertical along wall
@@ -327,9 +355,40 @@ class WallpaperCutTool {
         return CGPoint(x: max(0, min(1, u)), y: max(0, min(1, v)))
     }
 
+    /// Manual wall: project onto the user-defined plane defined by center + normal.
+    private func manualWallUV(worldPos: SIMD3<Float>, wallData: WallData) -> CGPoint? {
+        guard let center = wallData.manualCenter,
+              let normal = wallData.manualNormal else { return nil }
+
+        let pw = wallData.width
+        let ph = wallData.height
+        guard pw > 0.01, ph > 0.01 else { return nil }
+
+        // Build orthonormal basis for the wall:
+        //   - up axis = world up projected onto the wall (gravity-aligned)
+        //   - right axis = normal × up
+        let worldUp = SIMD3<Float>(0, 1, 0)
+        // Project worldUp onto the wall plane
+        let upOnWall = simd_normalize(worldUp - simd_dot(worldUp, normal) * normal)
+        let right = simd_normalize(simd_cross(upOnWall, normal))
+
+        // Vector from wall center to the world point
+        let delta = worldPos - center
+
+        // Project delta onto the wall's local right and up axes
+        let localX = simd_dot(delta, right)   // horizontal offset in meters
+        let localY = simd_dot(delta, upOnWall) // vertical offset in meters
+
+        // Convert to UV (0..1)
+        let u = CGFloat(localX / pw + 0.5)
+        let v = CGFloat(1.0 - (localY / ph + 0.5))
+        return CGPoint(x: max(0, min(1, u)), y: max(0, min(1, v)))
+    }
+
     private func addPhysicalPadding(uvRect: CGRect, wallData: WallData, meters: Float) -> CGRect {
-        let pw = wallData.anchor.planeExtent.width
-        let ph = wallData.anchor.planeExtent.height
+        // CHANGED: use wallData.width/height (works for both auto and manual)
+        let pw = wallData.width
+        let ph = wallData.height
         guard pw > 0, ph > 0 else { return uvRect }
         return uvRect.insetBy(dx: -CGFloat(meters / pw), dy: -CGFloat(meters / ph))
     }
@@ -446,18 +505,15 @@ class WallpaperCutTool {
     }
 
     private func drawPaperLiftShadow(_ shape: CutShape, size: CGSize, ctx: CGContext) {
-        // Build paths: the hole boundary and the shadow ring outside it
         let holePath  = buildPath(shape, size: size, inset: 0)
         let outerPath = buildPath(shape, size: size, inset: -shadowRingWidth)
 
         ctx.saveGState()
 
-        // Clip to annular ring (between outer and hole edge)
         ctx.addPath(outerPath)
         ctx.addPath(holePath)
         ctx.clip(using: .evenOdd)
 
-        // Draw dark fill offset toward bottom-right (directional paper-lift shadow)
         ctx.translateBy(x: shadowOffset.width, y: shadowOffset.height)
         ctx.setFillColor(UIColor(white: shadowGray, alpha: shadowAlpha).cgColor)
         ctx.addPath(holePath)

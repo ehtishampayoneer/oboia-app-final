@@ -48,13 +48,30 @@ class AREvent {
 
   String? get tool => data['tool'] as String?;
 
-  // CHANGED: Lock event accessor ------------------------------------------
+  // Lock event accessor ----------------------------------------------------
   bool? get locked => data['locked'] as bool?;
 
-  // CHANGED: Obstacle hint accessor ---------------------------------------
+  // Obstacle hint accessor -------------------------------------------------
   int? get obstacleCount => data['count'] is int
       ? data['count'] as int
       : (data['count'] as num?)?.toInt();
+
+  // CHANGED: Manual mode event accessors -----------------------------------
+
+  /// For `suggestManual` events: why manual mode is being suggested
+  /// (e.g. "no_planes_detected").
+  /// For `manualWallFailed` events: the failure reason from the selector.
+  String? get reason => data['reason'] as String?;
+
+  /// For `manualCornerAdded` events: which corner number was just added (1-4).
+  int? get cornerNumber => data['corner'] is int
+      ? data['corner'] as int
+      : (data['corner'] as num?)?.toInt();
+
+  /// For `manualCornerAdded` events: total corners required (always 4).
+  int? get totalCorners => data['total'] is int
+      ? data['total'] as int
+      : (data['total'] as num?)?.toInt();
 }
 
 /// Wall measurements computed from an AR plane extent.
@@ -107,10 +124,28 @@ class ARService {
   StreamSubscription<dynamic>? _eventSub;
   bool _initialized = false;
 
-  /// Stream of native events (wallDetected, wallUpdated, wallSelected,
-  /// wallpaperPlaced, cutUpdate, cutModeDone, cutToolChanged,
-  /// wallLockChanged, obstacleHint, sessionInterrupted, sessionResumed,
-  /// error, …).
+  /// Stream of native events. All event types currently emitted:
+  ///
+  /// **Auto plane detection:**
+  ///   - wallDetected, wallUpdated, wallSelected, wallpaperPlaced
+  ///
+  /// **Manual mode (new):**
+  ///   - suggestManual          — native couldn't find planes; offer manual
+  ///   - manualModeEntered      — overlay shown
+  ///   - manualModeExited       — overlay hidden
+  ///   - manualCornerAdded      — user tapped a corner (1..4)
+  ///   - manualReset            — user tapped Restart
+  ///   - manualWallFailed       — raycast missed
+  ///   - manualWallReady        — 4 corners captured, wall is ready
+  ///
+  /// **Cut mode:**
+  ///   - cutUpdate, cutModeDone, cutToolChanged
+  ///
+  /// **Lock:**
+  ///   - wallLockChanged
+  ///
+  /// **Other:**
+  ///   - obstacleHint, sessionInterrupted, sessionResumed, error
   Stream<AREvent> get events => _controller.stream;
 
   /// Should be called once when the AR screen opens.
@@ -215,7 +250,7 @@ class ARService {
     );
   }
 
-  /// CHANGED: Lock or unlock a wall.
+  /// Lock or unlock a wall.
   ///
   /// When locked, the native AR engine stops resizing the wall as ARKit
   /// refines the plane estimate. This lets the user walk around the room
@@ -239,6 +274,39 @@ class ARService {
     await _eventSub?.cancel();
     _eventSub = null;
     _initialized = false;
+  }
+
+  // ── CHANGED: Manual Mode Methods ────────────────────────────────────────
+
+  /// Switch into manual 4-corner tap mode.
+  ///
+  /// The native overlay appears with instructions ("Tap the TOP-LEFT corner…"),
+  /// and as the user taps corners the engine emits `manualCornerAdded` events.
+  /// Once the 4th corner is tapped, native fires `manualWallReady` AND a
+  /// `wallDetected` event (so the rest of the Flutter UI flows naturally).
+  ///
+  /// Use this when:
+  ///   - User explicitly taps a "Mark wall manually" button
+  ///   - Native emits `suggestManual` because plane detection failed
+  Future<void> enterManualMode() async {
+    await _channel.invokeMethod<void>('enterManualMode');
+  }
+
+  /// Exit manual mode and return to auto plane detection.
+  ///
+  /// Hides the manual selector overlay. Any partially-captured corners
+  /// are discarded.
+  Future<void> exitManualMode() async {
+    await _channel.invokeMethod<void>('exitManualMode');
+  }
+
+  /// Reset the manual selector — clears any tapped corners but stays in
+  /// manual mode so the user can start over.
+  ///
+  /// Equivalent to the user tapping the "Restart" button on the native
+  /// overlay, but exposed for Flutter-side restart UI if needed.
+  Future<void> resetManual() async {
+    await _channel.invokeMethod<void>('resetManual');
   }
 
   // ── Cut Mode Methods ────────────────────────────────────────────────────

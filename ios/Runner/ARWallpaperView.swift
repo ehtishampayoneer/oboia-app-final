@@ -212,7 +212,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         }
 
         let config = ARWorldTrackingConfiguration()
-        config.planeDetection = [.vertical, .horizontal]   // Both — helps tracking in featureless rooms
+        config.planeDetection = [.vertical, .horizontal]
         config.isLightEstimationEnabled = true
         config.worldAlignment = .gravity
         config.maximumNumberOfTrackedImages = 0
@@ -451,16 +451,10 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         let index = nextWallIndex
         nextWallIndex += 1
 
-        // Build the wallpaper plane node from corner points
-        let wallNode = makeManualWallNode(
-            corners: worldPoints,
-            center: center,
-            normal: normal,
-            width: width,
-            height: height
-        )
-
-        // Build a marker showing the wall outline
+        // FIXED: only build the visual marker. The wallpaper node is created
+        // later by attachWallpaper when the user actually picks a wallpaper.
+        // The previous version pre-created a dead "wallNode" that was added
+        // as a child of the marker but never used, leaving an orphan node.
         let marker = makeManualWallMarker(
             corners: worldPoints,
             center: center,
@@ -479,10 +473,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
             height: height,
             index: index
         )
-        // Pre-attach the empty wall node — wallpaper will attach to it later
-        wall.markerNode.addChildNode(wallNode)
-        wall.wallpaperNode = wallNode  // placeholder; material set when wallpaper placed
-        wall.wallpaperNode = nil       // reset — actually, keep the node empty until placement
+        // wallpaperNode stays nil until attachWallpaper runs.
 
         // Add marker to scene
         arView.scene.rootNode.addChildNode(marker)
@@ -490,6 +481,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         // Deselect previously selected wall, select this one
         if let prevId = selectedWallId, let prev = walls[prevId] {
             prev.isSelected = false
+            updateMarkerAppearance(wall: prev, selected: false)
         }
         wall.isSelected = true
         selectedWallId = wall.id
@@ -527,37 +519,8 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
     // MARK: - Manual wall geometry
 
-    /// Build a SCNNode representing the user-defined wall.
-    /// The wallpaper plane is positioned at the polygon center, oriented along its normal.
-    private func makeManualWallNode(
-        corners: [SIMD3<Float>],
-        center: SIMD3<Float>,
-        normal: SIMD3<Float>,
-        width: Float,
-        height: Float
-    ) -> SCNNode {
-        // Empty node that will receive the wallpaper material later
-        let node = SCNNode()
-        node.simdPosition = center
-
-        // Orient: rotate so the plane's normal matches the computed wall normal.
-        // SCNPlane lies in XY by default with normal pointing +Z.
-        let up = SIMD3<Float>(0, 0, 1)
-        let dot = simd_dot(up, normal)
-        if abs(dot - 1.0) < 1e-4 {
-            // already facing
-        } else if abs(dot + 1.0) < 1e-4 {
-            node.eulerAngles = SCNVector3(0, Float.pi, 0)
-        } else {
-            let axis = simd_normalize(simd_cross(up, normal))
-            let angle = acos(dot)
-            node.simdOrientation = simd_quaternion(angle, axis)
-        }
-
-        return node
-    }
-
-    /// Build a visual marker outlining the manual wall corners.
+    /// Build a visual marker outlining the manual wall corners (gold lines).
+    /// This is the only thing that lives in the scene until a wallpaper is picked.
     private func makeManualWallMarker(
         corners: [SIMD3<Float>],
         center: SIMD3<Float>,
@@ -786,6 +749,8 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
             // Position at wall center, oriented to face along the normal
             node.simdPosition = wall.manualCenter ?? SIMD3<Float>(0, 0, 0)
             if let n = wall.manualNormal {
+                // SCNPlane lies in XY plane with normal facing +Z by default.
+                // Rotate so its +Z aligns with the wall's normal.
                 let up = SIMD3<Float>(0, 0, 1)
                 let dot = simd_dot(up, n)
                 if abs(dot - 1.0) < 1e-4 {

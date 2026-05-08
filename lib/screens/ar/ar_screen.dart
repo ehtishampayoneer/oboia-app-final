@@ -119,26 +119,24 @@ class _ARScreenState extends State<ARScreen>
     }
   }
 
+  // ── CHANGED: _boot replaced with richer debug prints + fallback retry ──
   Future<void> _boot() async {
     debugPrint('[AR] boot: starting');
     _sub = _ar.events.listen(_onAREvent);
     await _ar.initAR();
-    debugPrint('[AR] boot: native AR initialized');
+    debugPrint('[AR] boot: AR init done');
 
     if (_currentShop == null) {
-      debugPrint('[AR] boot: no current shop');
+      debugPrint('[AR] boot: no shop — marking preload done');
       setState(() => _preloadDone = true);
       return;
     }
 
+    debugPrint('[AR] boot: shop=${_currentShop!.id}');
     final shopProvider = context.read<ShopProvider>();
 
-    // CRITICAL FIX: Make sure the wallpaper listener for this shop is
-    // running. Without this, wallpapersForShop() returns an empty list
-    // and AR has nothing to preload — that's why "Preparing textures…
-    // 0%" used to hang forever.
-    debugPrint('[AR] boot: starting wallpaper listener for ${_currentShop!.id}');
     shopProvider.startListeningToWallpapers(_currentShop!.id);
+    debugPrint('[AR] boot: listener started');
 
     // Also start listeners for any other shops we already know about,
     // so the bottom bar can show their wallpapers too.
@@ -146,10 +144,13 @@ class _ARScreenState extends State<ARScreen>
       shopProvider.startListeningToWallpapers(s.id);
     }
 
+    _pending ??= shopProvider.initialWallpaper;
+
     // React to provider updates so wallpapers that arrive AFTER this
     // screen mounts still get preloaded and shown in the bar.
     _shopProviderListener = () {
       if (!mounted) return;
+      debugPrint('[AR] provider notified — kicking preload');
       _kickPreload();
       setState(() {}); // rebuild bottom bar with newly loaded wallpapers
     };
@@ -157,6 +158,15 @@ class _ARScreenState extends State<ARScreen>
 
     // First-pass preload with whatever's already in the cache.
     _kickPreload();
+    debugPrint('[AR] boot: first kickPreload done');
+
+    // Fallback: if wallpapers arrive async and notifyListeners()
+    // was missed, retry after 2 seconds
+    Future.delayed(const Duration(seconds: 2), () {
+      if (!mounted) return;
+      debugPrint('[AR] fallback retry: kicking preload again');
+      _kickPreload();
+    });
   }
 
   // Idempotent preload. Safe to call repeatedly as wallpapers stream
@@ -166,6 +176,8 @@ class _ARScreenState extends State<ARScreen>
       debugPrint('[AR] kickPreload: already in flight');
       return;
     }
+    // CHANGED: diagnostic print to see shop + wallpaper count on every call
+    debugPrint('[AR] kickPreload: shop=${_currentShop?.id}, wallpapers=${context.read<ShopProvider>().wallpapersForShop(_currentShop?.id ?? "").length}');
     if (_currentShop == null) {
       setState(() => _preloadDone = true);
       return;

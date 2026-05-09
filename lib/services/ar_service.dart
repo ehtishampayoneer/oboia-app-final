@@ -1,15 +1,133 @@
 // lib/services/ar_service.dart
 //
-// Dart-side bridge to the native ARKit (iOS) and ARCore+Filament (Android)
-// wallpaper renderer. Uses a MethodChannel for commands and an EventChannel
-// for wall-detection / measurement / selection events.
+// Dart-side bridge to native ARKit (iOS) / ARCore (Android) wallpaper renderer.
+//
+// v2.0 (May 2026) — bulletproof event bridge:
+//   - Native events are buffered until the FIRST Dart listener attaches,
+//     so the boot beacon never gets silently dropped.
+//   - Every event is also captured into a circular ring buffer of the last
+//     500 lines, accessible via ARService.instance.recentLogs.
+//   - Logs are also appended to Documents/oboia-debug.log on every event,
+//     surviving app restarts.
+//   - DiagnosticLog.dump() returns the entire ring buffer as a String for
+//     on-screen display.
 
 import 'dart:async';
+import 'dart:collection';
+import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../models/wallpaper_model.dart';
 
-/// Event emitted by the native AR layer.
+// ─────────────────────────────────────────────────────────────────────────
+// DIAGNOSTIC LOG — global, never throws, always available
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Global diagnostic log. Captures every meaningful event in the AR pipeline.
+/// Three sinks for redundancy:
+///  1) In-memory ring buffer (last 500 entries) — for on-screen viewer
+///  2) debugPrint — flows to Flutter overlay + IDE + Codemagic build log
+///  3) On-disk file: Documents/oboia-debug.log — survives app crashes
+///
+/// All sinks are best-effort. If file write fails, others continue.
+class DiagnosticLog {
+  DiagnosticLog._();
+  static final DiagnosticLog instance = DiagnosticLog._();
+
+  static const int _maxEntries = 500;
+  final Queue<String> _ring = Queue<String>();
+  File? _file;
+  bool _fileInitInFlight = false;
+  bool _fileInitFailed = false;
+
+  /// Add a line to all sinks. Format: HH:mm:ss.SSS [tag] message.
+  void log(String tag, String message) {
+    final ts = _timestamp();
+    final line = '$ts [$tag] $message';
+
+    // Sink 1: ring buffer (for on-screen viewer)
+    _ring.addLast(line);
+    while (_ring.length > _maxEntries) {
+      _ring.removeFirst();
+    }
+
+    // Sink 2: debugPrint (Flutter overlay, IDE)
+    debugPrint(line);
+
+    // Sink 3: file (best effort, async, never blocks)
+    _appendToFile(line);
+  }
+
+  String _timestamp() {
+    final now = DateTime.now();
+    String pad(int n, [int w = 2]) => n.toString().padLeft(w, '0');
+    return '${pad(now.hour)}:${pad(now.minute)}:${pad(now.second)}.${pad(now.millisecond, 3)}';
+  }
+
+  Future<void> _appendToFile(String line) async {
+    if (_fileInitFailed) return;
+    try {
+      _file ??= await _initFile();
+      if (_file == null) return;
+      await _file!.writeAsString('$line\n', mode: FileMode.append, flush: false);
+    } catch (_) {
+      // Don't let file errors break logging. Subsequent calls will retry init.
+    }
+  }
+
+  Future<File?> _initFile() async {
+    if (_fileInitInFlight) return null;
+    _fileInitInFlight = true;
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final f = File('${dir.path}/oboia-debug.log');
+      // Truncate to keep it bounded across launches; comment this line if you want growing log.
+      if (await f.exists() && (await f.length()) > 1024 * 1024) {
+        await f.writeAsString(''); // reset if >1MB
+      }
+      _fileInitInFlight = false;
+      return f;
+    } catch (_) {
+      _fileInitFailed = true;
+      _fileInitInFlight = false;
+      return null;
+    }
+  }
+
+  /// Snapshot of the current ring buffer as a single string. Newest at the bottom.
+  String dump() {
+    return _ring.join('\n');
+  }
+
+  /// Clear the in-memory ring buffer (file is untouched).
+  void clear() {
+    _ring.clear();
+  }
+
+  /// Read entire on-disk log file as a string. Returns empty if no file yet.
+  Future<String> readFileLog() async {
+    try {
+      final f = _file ?? await _initFile();
+      if (f == null) return '';
+      if (!await f.exists()) return '';
+      return await f.readAsString();
+    } catch (e) {
+      return '(failed to read log file: $e)';
+    }
+  }
+}
+
+/// Convenience top-level logger.
+void dlog(String tag, String message) {
+  DiagnosticLog.instance.log(tag, message);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AR EVENT MODEL
+// ─────────────────────────────────────────────────────────────────────────
+
 class AREvent {
   final String type;
   final Map<String, dynamic> data;
@@ -27,8 +145,6 @@ class AREvent {
     );
   }
 
-  // Convenience accessors for the common event payloads --------------------
-
   int? get wallIndex => data['wallIndex'] is int
       ? data['wallIndex'] as int
       : (data['wallIndex'] as num?)?.toInt();
@@ -40,41 +156,25 @@ class AREvent {
   String? get errorCode => data['code'] as String?;
   String? get errorMessage => data['message'] as String?;
 
-  // Cut mode event accessors -----------------------------------------------
-
   int? get cutCount => data['cutCount'] is int
       ? data['cutCount'] as int
       : (data['cutCount'] as num?)?.toInt();
 
   String? get tool => data['tool'] as String?;
-
-  // Lock event accessor ----------------------------------------------------
   bool? get locked => data['locked'] as bool?;
-
-  // Obstacle hint accessor -------------------------------------------------
   int? get obstacleCount => data['count'] is int
       ? data['count'] as int
       : (data['count'] as num?)?.toInt();
 
-  // CHANGED: Manual mode event accessors -----------------------------------
-
-  /// For `suggestManual` events: why manual mode is being suggested
-  /// (e.g. "no_planes_detected").
-  /// For `manualWallFailed` events: the failure reason from the selector.
   String? get reason => data['reason'] as String?;
-
-  /// For `manualCornerAdded` events: which corner number was just added (1-4).
   int? get cornerNumber => data['corner'] is int
       ? data['corner'] as int
       : (data['corner'] as num?)?.toInt();
-
-  /// For `manualCornerAdded` events: total corners required (always 4).
   int? get totalCorners => data['total'] is int
       ? data['total'] as int
       : (data['total'] as num?)?.toInt();
 }
 
-/// Wall measurements computed from an AR plane extent.
 class WallMeasurements {
   final int wallIndex;
   final double width;
@@ -88,11 +188,7 @@ class WallMeasurements {
     required this.sqm,
   });
 
-  /// rollsNeeded = ceil(sqm / (rollWidth × rollLength)).
-  int rollsNeeded({
-    required double rollWidth,
-    required double rollLength,
-  }) {
+  int rollsNeeded({required double rollWidth, required double rollLength}) {
     final perRoll = rollWidth * rollLength;
     if (perRoll <= 0) return 0;
     return (sqm / perRoll).ceil();
@@ -103,15 +199,14 @@ class WallMeasurements {
     required double rollLength,
     required double pricePerRoll,
   }) {
-    return rollsNeeded(
-          rollWidth: rollWidth,
-          rollLength: rollLength,
-        ) *
-        pricePerRoll;
+    return rollsNeeded(rollWidth: rollWidth, rollLength: rollLength) * pricePerRoll;
   }
 }
 
-/// Singleton bridge to the native AR renderer.
+// ─────────────────────────────────────────────────────────────────────────
+// ARSERVICE — bulletproof bridge with buffering
+// ─────────────────────────────────────────────────────────────────────────
+
 class ARService {
   ARService._();
   static final ARService instance = ARService._();
@@ -119,71 +214,109 @@ class ARService {
   static const _channel = MethodChannel('com.oboia/ar');
   static const _eventChannel = EventChannel('com.oboia/ar_events');
 
-  final StreamController<AREvent> _controller =
-      StreamController<AREvent>.broadcast();
+  /// Sync stream controller: events are delivered immediately to all listeners,
+  /// but if no listener is attached yet, we buffer in [_pendingEvents].
+  final StreamController<AREvent> _controller = StreamController<AREvent>.broadcast();
+
+  /// Events that arrived from native before Dart attached its first listener.
+  /// Drained as soon as a listener attaches.
+  final List<AREvent> _pendingEvents = [];
+
+  /// True once at least one listener has subscribed via [events] getter.
+  bool _hasListener = false;
+
   StreamSubscription<dynamic>? _eventSub;
   bool _initialized = false;
 
-  /// Stream of native events. All event types currently emitted:
-  ///
-  /// **Auto plane detection:**
-  ///   - wallDetected, wallUpdated, wallSelected, wallpaperPlaced
-  ///
-  /// **Manual mode (new):**
-  ///   - suggestManual          — native couldn't find planes; offer manual
-  ///   - manualModeEntered      — overlay shown
-  ///   - manualModeExited       — overlay hidden
-  ///   - manualCornerAdded      — user tapped a corner (1..4)
-  ///   - manualReset            — user tapped Restart
-  ///   - manualWallFailed       — raycast missed
-  ///   - manualWallReady        — 4 corners captured, wall is ready
-  ///
-  /// **Cut mode:**
-  ///   - cutUpdate, cutModeDone, cutToolChanged
-  ///
-  /// **Lock:**
-  ///   - wallLockChanged
-  ///
-  /// **Other:**
-  ///   - obstacleHint, sessionInterrupted, sessionResumed, error
-  Stream<AREvent> get events => _controller.stream;
+  /// Stream of native events. The first listener triggers a drain of any
+  /// events that arrived early.
+  Stream<AREvent> get events {
+    return Stream<AREvent>.multi((controller) {
+      _hasListener = true;
+      dlog('AR-DART', 'listener attached, draining ${_pendingEvents.length} pending events');
 
-  /// Should be called once when the AR screen opens.
+      // Drain any buffered events to this new listener
+      final buffered = List<AREvent>.from(_pendingEvents);
+      _pendingEvents.clear();
+      for (final ev in buffered) {
+        controller.add(ev);
+      }
+
+      // Subscribe controller to live stream
+      final sub = _controller.stream.listen(
+        controller.add,
+        onError: controller.addError,
+        onDone: controller.close,
+      );
+
+      controller.onCancel = () {
+        sub.cancel();
+      };
+    });
+  }
+
+  void _emit(AREvent ev) {
+    dlog('AR-DART', 'event recv type=${ev.type} data=${ev.data}');
+    if (_hasListener) {
+      _controller.add(ev);
+    } else {
+      _pendingEvents.add(ev);
+      if (_pendingEvents.length > 200) {
+        _pendingEvents.removeAt(0); // bound buffer
+      }
+    }
+  }
+
   Future<void> initAR() async {
-    if (_initialized) return;
+    dlog('AR-DART', 'initAR() called, _initialized=$_initialized');
+    if (_initialized) {
+      dlog('AR-DART', 'initAR() already initialized — ensuring listener still attached');
+      // If a previous instance disposed the eventSub, re-attach it.
+      if (_eventSub == null) {
+        _attachEventChannel();
+      }
+      return;
+    }
     _initialized = true;
 
+    _attachEventChannel();
+
+    try {
+      dlog('AR-DART', 'invoking initAR method on channel');
+      await _channel.invokeMethod<void>('initAR');
+      dlog('AR-DART', 'initAR method returned successfully');
+    } on PlatformException catch (e) {
+      dlog('AR-DART', 'initAR method FAILED: code=${e.code} msg=${e.message}');
+      _emit(AREvent(
+        type: 'error',
+        data: {'code': e.code, 'message': e.message ?? ''},
+      ));
+    }
+  }
+
+  void _attachEventChannel() {
+    dlog('AR-DART', 'attaching to event channel com.oboia/ar_events');
     _eventSub = _eventChannel.receiveBroadcastStream().listen(
       (event) {
         if (event is Map) {
-          final map = event.map(
-            (k, v) => MapEntry(k.toString(), v),
-          );
-          _controller.add(AREvent.fromMap(map));
+          final map = event.map((k, v) => MapEntry(k.toString(), v));
+          _emit(AREvent.fromMap(map));
+        } else {
+          dlog('AR-DART', 'event channel got non-Map: ${event.runtimeType}');
         }
       },
       onError: (err) {
-        _controller.add(AREvent(
+        dlog('AR-DART', 'event channel ERROR: $err');
+        _emit(AREvent(
           type: 'error',
-          data: {
-            'message': err.toString(),
-            'code': 'stream_error',
-          },
+          data: {'message': err.toString(), 'code': 'stream_error'},
         ));
       },
+      onDone: () {
+        dlog('AR-DART', 'event channel closed (onDone)');
+      },
     );
-
-    try {
-      await _channel.invokeMethod<void>('initAR');
-    } on PlatformException catch (e) {
-      _controller.add(AREvent(
-        type: 'error',
-        data: {
-          'code': e.code,
-          'message': e.message ?? '',
-        },
-      ));
-    }
+    dlog('AR-DART', 'event channel listener attached');
   }
 
   // ── Wallpaper Methods ───────────────────────────────────────────────────
@@ -193,16 +326,25 @@ class ARService {
     required int wallIndex,
     required double pricePerRoll,
   }) async {
-    await _channel.invokeMethod<void>('placeWallpaper', {
-      'albedoUrl': wallpaper.pbr.albedoUrl,
-      'normalUrl': wallpaper.pbr.normalUrl,
-      'roughnessUrl': wallpaper.pbr.roughnessUrl,
-      'aoUrl': wallpaper.pbr.aoUrl,
-      'rollWidth': wallpaper.rollWidth,
-      'rollLength': wallpaper.rollLength,
-      'pricePerRoll': pricePerRoll,
-      'wallIndex': wallIndex,
-    });
+    dlog('AR-DART', 'placeWallpaper wallIndex=$wallIndex name="${wallpaper.name}"');
+    dlog('AR-DART', '  albedoUrl="${wallpaper.pbr.albedoUrl}"');
+    dlog('AR-DART', '  rollWidth=${wallpaper.rollWidth} rollLength=${wallpaper.rollLength}');
+    try {
+      await _channel.invokeMethod<void>('placeWallpaper', {
+        'albedoUrl': wallpaper.pbr.albedoUrl,
+        'normalUrl': wallpaper.pbr.normalUrl,
+        'roughnessUrl': wallpaper.pbr.roughnessUrl,
+        'aoUrl': wallpaper.pbr.aoUrl,
+        'rollWidth': wallpaper.rollWidth,
+        'rollLength': wallpaper.rollLength,
+        'pricePerRoll': pricePerRoll,
+        'wallIndex': wallIndex,
+      });
+      dlog('AR-DART', 'placeWallpaper method returned OK');
+    } on PlatformException catch (e) {
+      dlog('AR-DART', 'placeWallpaper FAILED: ${e.code} ${e.message}');
+      rethrow;
+    }
   }
 
   Future<void> switchWallpaper({
@@ -210,30 +352,33 @@ class ARService {
     required int wallIndex,
     required double pricePerRoll,
   }) async {
-    await _channel.invokeMethod<void>('switchWallpaper', {
-      'albedoUrl': wallpaper.pbr.albedoUrl,
-      'normalUrl': wallpaper.pbr.normalUrl,
-      'roughnessUrl': wallpaper.pbr.roughnessUrl,
-      'aoUrl': wallpaper.pbr.aoUrl,
-      'rollWidth': wallpaper.rollWidth,
-      'rollLength': wallpaper.rollLength,
-      'pricePerRoll': pricePerRoll,
-      'wallIndex': wallIndex,
-    });
+    dlog('AR-DART', 'switchWallpaper wallIndex=$wallIndex name="${wallpaper.name}"');
+    try {
+      await _channel.invokeMethod<void>('switchWallpaper', {
+        'albedoUrl': wallpaper.pbr.albedoUrl,
+        'normalUrl': wallpaper.pbr.normalUrl,
+        'roughnessUrl': wallpaper.pbr.roughnessUrl,
+        'aoUrl': wallpaper.pbr.aoUrl,
+        'rollWidth': wallpaper.rollWidth,
+        'rollLength': wallpaper.rollLength,
+        'pricePerRoll': pricePerRoll,
+        'wallIndex': wallIndex,
+      });
+      dlog('AR-DART', 'switchWallpaper method returned OK');
+    } on PlatformException catch (e) {
+      dlog('AR-DART', 'switchWallpaper FAILED: ${e.code} ${e.message}');
+      rethrow;
+    }
   }
 
   Future<void> selectWall(int wallIndex) async {
-    await _channel.invokeMethod<void>(
-      'selectWall',
-      {'wallIndex': wallIndex},
-    );
+    dlog('AR-DART', 'selectWall wallIndex=$wallIndex');
+    await _channel.invokeMethod<void>('selectWall', {'wallIndex': wallIndex});
   }
 
   Future<void> clearWall(int wallIndex) async {
-    await _channel.invokeMethod<void>(
-      'clearWall',
-      {'wallIndex': wallIndex},
-    );
+    dlog('AR-DART', 'clearWall wallIndex=$wallIndex');
+    await _channel.invokeMethod<void>('clearWall', {'wallIndex': wallIndex});
   }
 
   Future<WallMeasurements?> getWallMeasurements(int wallIndex) async {
@@ -250,15 +395,8 @@ class ARService {
     );
   }
 
-  /// Lock or unlock a wall.
-  ///
-  /// When locked, the native AR engine stops resizing the wall as ARKit
-  /// refines the plane estimate. This lets the user walk around the room
-  /// without the wallpaper subtly shifting. Unlocking resumes tracking.
-  Future<void> lockWall({
-    required int wallIndex,
-    required bool locked,
-  }) async {
+  Future<void> lockWall({required int wallIndex, required bool locked}) async {
+    dlog('AR-DART', 'lockWall wallIndex=$wallIndex locked=$locked');
     await _channel.invokeMethod<void>('lockWall', {
       'wallIndex': wallIndex,
       'locked': locked,
@@ -266,67 +404,44 @@ class ARService {
   }
 
   Future<void> disposeAR() async {
+    dlog('AR-DART', 'disposeAR called');
     try {
       await _channel.invokeMethod<void>('disposeAR');
-    } catch (_) {
-      // ignore
-    }
+    } catch (_) {}
     await _eventSub?.cancel();
     _eventSub = null;
     _initialized = false;
+    dlog('AR-DART', 'disposeAR complete');
   }
 
-  // ── CHANGED: Manual Mode Methods ────────────────────────────────────────
+  // ── Manual Mode Methods ────────────────────────────────────────────────
 
-  /// Switch into manual 4-corner tap mode.
-  ///
-  /// The native overlay appears with instructions ("Tap the TOP-LEFT corner…"),
-  /// and as the user taps corners the engine emits `manualCornerAdded` events.
-  /// Once the 4th corner is tapped, native fires `manualWallReady` AND a
-  /// `wallDetected` event (so the rest of the Flutter UI flows naturally).
-  ///
-  /// Use this when:
-  ///   - User explicitly taps a "Mark wall manually" button
-  ///   - Native emits `suggestManual` because plane detection failed
   Future<void> enterManualMode() async {
+    dlog('AR-DART', 'enterManualMode invoked');
     await _channel.invokeMethod<void>('enterManualMode');
+    dlog('AR-DART', 'enterManualMode method returned');
   }
 
-  /// Exit manual mode and return to auto plane detection.
-  ///
-  /// Hides the manual selector overlay. Any partially-captured corners
-  /// are discarded.
   Future<void> exitManualMode() async {
+    dlog('AR-DART', 'exitManualMode invoked');
     await _channel.invokeMethod<void>('exitManualMode');
   }
 
-  /// Reset the manual selector — clears any tapped corners but stays in
-  /// manual mode so the user can start over.
-  ///
-  /// Equivalent to the user tapping the "Restart" button on the native
-  /// overlay, but exposed for Flutter-side restart UI if needed.
   Future<void> resetManual() async {
+    dlog('AR-DART', 'resetManual invoked');
     await _channel.invokeMethod<void>('resetManual');
   }
 
   // ── Cut Mode Methods ────────────────────────────────────────────────────
 
-  /// Enter cut mode on the specified wall.
-  /// Shows the cutting toolbar overlay.
   Future<void> enterCutMode(int wallIndex) async {
-    await _channel.invokeMethod<void>(
-      'enterCutMode',
-      {'wallIndex': wallIndex},
-    );
+    await _channel.invokeMethod<void>('enterCutMode', {'wallIndex': wallIndex});
   }
 
-  /// Exit cut mode and hide the cutting toolbar.
   Future<void> exitCutMode() async {
     await _channel.invokeMethod<void>('exitCutMode');
   }
 
-  /// Smart auto-cut: user taps on a socket or switch.
-  /// Vision framework detects boundary automatically.
   Future<void> smartCut({
     required double screenX,
     required double screenY,
@@ -339,8 +454,6 @@ class ARService {
     });
   }
 
-  /// Manual rectangle cut using screen coordinates.
-  /// Converts to wall UV space on native side.
   Future<void> rectangleCut({
     required double screenMinX,
     required double screenMinY,
@@ -357,8 +470,6 @@ class ARService {
     });
   }
 
-  /// Manual freehand cut using a list of screen points.
-  /// Points are converted to wall UV space on native side.
   Future<void> freehandCut({
     required List<Map<String, double>> screenPoints,
     required int wallIndex,
@@ -369,8 +480,6 @@ class ARService {
     });
   }
 
-  /// Manual circle cut using screen coordinates.
-  /// Center and radius converted to wall UV space on native side.
   Future<void> circleCut({
     required double screenCenterX,
     required double screenCenterY,
@@ -385,20 +494,11 @@ class ARService {
     });
   }
 
-  /// Undo the last cut on the specified wall.
-  /// Native side sends back cutUpdate event with new cutCount.
   Future<void> undoCut(int wallIndex) async {
-    await _channel.invokeMethod<void>(
-      'undoCut',
-      {'wallIndex': wallIndex},
-    );
+    await _channel.invokeMethod<void>('undoCut', {'wallIndex': wallIndex});
   }
 
-  /// Clear all cuts on the specified wall.
   Future<void> clearAllCuts(int wallIndex) async {
-    await _channel.invokeMethod<void>(
-      'clearAllCuts',
-      {'wallIndex': wallIndex},
-    );
+    await _channel.invokeMethod<void>('clearAllCuts', {'wallIndex': wallIndex});
   }
 }

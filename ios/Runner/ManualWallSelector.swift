@@ -3,14 +3,13 @@
 //  OBOIA
 //
 //  Universal wall selection for any surface — including completely blank
-//  walls where ARKit's vertical plane detection fails. User taps 4 corners
-//  of the wall, we raycast each tap into world space, fit a plane to the
-//  4 points, and build a quad geometry. Works on any device that supports
-//  ARKit (iOS 12+), no LiDAR required.
+//  walls where ARKit's vertical plane detection fails.
 //
-//  Visual: gold numbered dots appear at each tap. Lines draw between
-//  consecutive points. After 4 taps the polygon closes and the wall is
-//  ready for wallpaper placement.
+//  v1.3 (May 2026): Dots now PROJECT from stored world points every frame,
+//  so they stay locked to real wall positions as the camera moves.
+//  Previously dots were UIView subviews glued to screen pixels — they did
+//  not track the world. Fixed by adding a CADisplayLink that re-projects
+//  each frame using the AR scene's camera.
 //
 
 import UIKit
@@ -20,9 +19,6 @@ import SceneKit
 // MARK: - Delegate protocol
 
 protocol ManualWallSelectorDelegate: AnyObject {
-    /// Fired when the user has tapped enough corners to define a wall.
-    /// `worldPoints` is in world space, ordered: TL, TR, BR, BL.
-    /// `width` and `height` are the wall extent in meters.
     func manualSelector(
         _ selector: ManualWallSelector,
         didCompleteWithWorldPoints worldPoints: [SIMD3<Float>],
@@ -31,14 +27,8 @@ protocol ManualWallSelectorDelegate: AnyObject {
         center: SIMD3<Float>,
         normal: SIMD3<Float>
     )
-
-    /// Fired on each successful tap (1, 2, 3, 4).
     func manualSelector(_ selector: ManualWallSelector, didAddCornerNumber n: Int)
-
-    /// Fired when user cancels or restarts.
     func manualSelectorDidReset(_ selector: ManualWallSelector)
-
-    /// Fired when a tap fails to hit the world (e.g. tap on sky).
     func manualSelector(_ selector: ManualWallSelector, didFailWithReason reason: String)
 }
 
@@ -49,10 +39,14 @@ final class ManualWallSelector: UIView {
     weak var delegate: ManualWallSelectorDelegate?
     weak var sceneView: ARSCNView?
 
-    // Captured world points (max 4)
+    /// World-space points (the source of truth — never lose these)
     private(set) var worldPoints: [SIMD3<Float>] = []
-    // Captured screen points (parallel array, used for drawing UI)
-    private(set) var screenPoints: [CGPoint] = []
+
+    /// Current screen-space positions (recomputed every frame from worldPoints)
+    private var currentScreenPoints: [CGPoint] = []
+
+    /// Track which world points are visible in front of the camera
+    private var visibilityFlags: [Bool] = []
 
     // Drawing layers
     private let polygonLayer = CAShapeLayer()
@@ -70,6 +64,9 @@ final class ManualWallSelector: UIView {
     // Restart button
     private let restartButton = UIButton(type: .system)
 
+    // Per-frame projection driver
+    private var displayLink: CADisplayLink?
+
     // MARK: - Init
 
     override init(frame: CGRect) {
@@ -85,7 +82,7 @@ final class ManualWallSelector: UIView {
     private func setup() {
         backgroundColor = .clear
         isUserInteractionEnabled = true
-        isHidden = true   // shown only when manual mode is entered
+        isHidden = true
 
         setupPolygonLayers()
         setupInstruction()
@@ -169,9 +166,11 @@ final class ManualWallSelector: UIView {
             self.restartButton.alpha = 1
         }
         updateInstruction()
+        startDisplayLink()
     }
 
     func exit() {
+        stopDisplayLink()
         UIView.animate(withDuration: 0.18, animations: {
             self.instructionPill.alpha = 0
             self.restartButton.alpha = 0
@@ -183,7 +182,8 @@ final class ManualWallSelector: UIView {
 
     func reset() {
         worldPoints.removeAll()
-        screenPoints.removeAll()
+        currentScreenPoints.removeAll()
+        visibilityFlags.removeAll()
         dotViews.forEach { $0.removeFromSuperview() }
         dotViews.removeAll()
         polygonLayer.path = nil
@@ -196,6 +196,59 @@ final class ManualWallSelector: UIView {
         reset()
     }
 
+    // MARK: - CADisplayLink — re-projects worldPoints every frame
+
+    private func startDisplayLink() {
+        stopDisplayLink()
+        let link = CADisplayLink(target: self, selector: #selector(tick))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+        NSLog("[AR] manual selector display link started")
+    }
+
+    private func stopDisplayLink() {
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+
+    @objc private func tick() {
+        // Project every world point to current screen coords.
+        // sceneView.projectPoint converts world → screen pixels using the live camera.
+        guard let sceneView = sceneView, !worldPoints.isEmpty else { return }
+
+        // Ensure parallel arrays are sized correctly
+        if currentScreenPoints.count != worldPoints.count {
+            currentScreenPoints = Array(repeating: .zero, count: worldPoints.count)
+        }
+        if visibilityFlags.count != worldPoints.count {
+            visibilityFlags = Array(repeating: true, count: worldPoints.count)
+        }
+
+        for i in 0..<worldPoints.count {
+            let world = worldPoints[i]
+            let projected = sceneView.projectPoint(SCNVector3(world.x, world.y, world.z))
+            // projectPoint.z is depth in clip space. z > 1 means BEHIND the camera.
+            let isVisible = projected.z < 1.0 && projected.z > 0.0
+            visibilityFlags[i] = isVisible
+
+            let screen = CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))
+            currentScreenPoints[i] = screen
+
+            if i < dotViews.count {
+                let dot = dotViews[i]
+                if isVisible {
+                    if dot.isHidden { dot.isHidden = false }
+                    dot.center = screen
+                } else {
+                    // Point is behind the camera — hide it.
+                    if !dot.isHidden { dot.isHidden = true }
+                }
+            }
+        }
+
+        rebuildPolygonPath()
+    }
+
     // MARK: - Tap handling
 
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
@@ -203,10 +256,7 @@ final class ManualWallSelector: UIView {
         guard let sceneView = sceneView else { return }
         let screenPoint = gesture.location(in: self)
 
-        // Try several raycast strategies, in order of robustness:
-        //   1) Existing plane (if user is on a textured wall, this just works)
-        //   2) Estimated plane (works without detected geometry)
-        //   3) Feature point (last resort, may be inaccurate)
+        // Three-tier raycast strategy: existing plane → estimated plane → feature point
         var hitWorldPoint: SIMD3<Float>? = nil
         var hitNormal: SIMD3<Float>? = nil
 
@@ -220,6 +270,7 @@ final class ManualWallSelector: UIView {
             hitNormal = SIMD3<Float>(r.worldTransform.columns.2.x,
                                      r.worldTransform.columns.2.y,
                                      r.worldTransform.columns.2.z)
+            NSLog("[AR] manual tap hit existingPlane")
         } else if let q = sceneView.raycastQuery(from: screenPoint,
                                                  allowing: .estimatedPlane,
                                                  alignment: .any),
@@ -230,36 +281,36 @@ final class ManualWallSelector: UIView {
             hitNormal = SIMD3<Float>(r.worldTransform.columns.2.x,
                                      r.worldTransform.columns.2.y,
                                      r.worldTransform.columns.2.z)
+            NSLog("[AR] manual tap hit estimatedPlane")
         } else {
-            // Feature points fallback (for completely textureless surfaces)
             let hitTestResults = sceneView.hitTest(screenPoint, types: [.featurePoint])
             if let r = hitTestResults.first {
                 hitWorldPoint = SIMD3<Float>(r.worldTransform.columns.3.x,
                                              r.worldTransform.columns.3.y,
                                              r.worldTransform.columns.3.z)
+                NSLog("[AR] manual tap hit featurePoint")
             }
         }
 
         guard let world = hitWorldPoint else {
+            NSLog("[AR] manual tap MISSED — no surface")
             delegate?.manualSelector(self, didFailWithReason: "Tap closer to the wall — point camera at it directly")
             flashRedDot(at: screenPoint)
             return
         }
 
         worldPoints.append(world)
-        screenPoints.append(screenPoint)
+        currentScreenPoints.append(screenPoint)
+        visibilityFlags.append(true)
 
-        // Visual feedback
         addDot(at: screenPoint, number: worldPoints.count)
         rebuildPolygonPath()
         delegate?.manualSelector(self, didAddCornerNumber: worldPoints.count)
         updateInstruction()
 
-        // Light haptic
         let gen = UIImpactFeedbackGenerator(style: .light)
         gen.impactOccurred()
 
-        // 4th tap → finalize
         if worldPoints.count == 4 {
             finalizePolygon(suggestedNormal: hitNormal)
         }
@@ -270,11 +321,8 @@ final class ManualWallSelector: UIView {
     private func finalizePolygon(suggestedNormal: SIMD3<Float>?) {
         guard worldPoints.count == 4 else { return }
 
-        // Center = average of 4 corners
         let center = (worldPoints[0] + worldPoints[1] + worldPoints[2] + worldPoints[3]) / 4
 
-        // Compute width & height from corner distances:
-        // worldPoints are ordered TL, TR, BR, BL.
         let widthTop = simd_distance(worldPoints[0], worldPoints[1])
         let widthBottom = simd_distance(worldPoints[3], worldPoints[2])
         let heightLeft = simd_distance(worldPoints[0], worldPoints[3])
@@ -282,19 +330,17 @@ final class ManualWallSelector: UIView {
         let width = (widthTop + widthBottom) / 2
         let height = (heightLeft + heightRight) / 2
 
-        // Compute normal: cross product of two edges
-        let edge1 = simd_normalize(worldPoints[1] - worldPoints[0])  // TL -> TR
-        let edge2 = simd_normalize(worldPoints[3] - worldPoints[0])  // TL -> BL
+        let edge1 = simd_normalize(worldPoints[1] - worldPoints[0])  // TL→TR
+        let edge2 = simd_normalize(worldPoints[3] - worldPoints[0])  // TL→BL
         var normal = simd_normalize(simd_cross(edge1, edge2))
 
-        // If the suggested normal exists and points roughly the same way, use it
-        // (it tends to be more accurate than computed from points)
         if let suggested = suggestedNormal,
            simd_dot(normal, suggested) < 0 {
             normal = -normal
         }
 
-        // Strong success haptic
+        NSLog("[AR] manual finalize: w=\(width) h=\(height) center=\(center) normal=\(normal)")
+
         let gen = UINotificationFeedbackGenerator()
         gen.notificationOccurred(.success)
 
@@ -307,7 +353,6 @@ final class ManualWallSelector: UIView {
             normal: normal
         )
 
-        // Animate the polygon's success state
         flashPolygonSuccess()
     }
 
@@ -335,7 +380,6 @@ final class ManualWallSelector: UIView {
         label.font = .systemFont(ofSize: 13, weight: .heavy)
         container.addSubview(label)
 
-        // Spawn animation
         container.transform = CGAffineTransform(scaleX: 0.2, y: 0.2)
         container.alpha = 0
         addSubview(container)
@@ -362,32 +406,42 @@ final class ManualWallSelector: UIView {
         }) { _ in dot.removeFromSuperview() }
     }
 
+    /// Rebuild the polygon outline using the CURRENT projected screen points.
+    /// Called every frame from tick() AND immediately after each tap.
     private func rebuildPolygonPath() {
-        guard !screenPoints.isEmpty else {
+        guard !currentScreenPoints.isEmpty else {
             polygonLayer.path = nil
             dashedPreviewLayer.path = nil
             return
         }
 
-        // Solid stroke for the lines we have
-        let path = UIBezierPath()
-        path.move(to: screenPoints[0])
-        for i in 1..<screenPoints.count {
-            path.addLine(to: screenPoints[i])
+        // Build path through visible points only
+        let visiblePoints: [CGPoint] = zip(currentScreenPoints, visibilityFlags)
+            .compactMap { $0.1 ? $0.0 : nil }
+
+        guard !visiblePoints.isEmpty else {
+            polygonLayer.path = nil
+            dashedPreviewLayer.path = nil
+            return
         }
-        // Close the polygon visually only when we have all 4 corners
-        if screenPoints.count == 4 {
+
+        let path = UIBezierPath()
+        path.move(to: visiblePoints[0])
+        for i in 1..<visiblePoints.count {
+            path.addLine(to: visiblePoints[i])
+        }
+
+        if currentScreenPoints.count == 4 && visibilityFlags.allSatisfy({ $0 }) {
             path.close()
             polygonLayer.path = path.cgPath
             dashedPreviewLayer.path = nil
         } else {
             polygonLayer.path = path.cgPath
-            // Hint where to tap next: dashed preview to the first dot
-            // to suggest the closing edge they're working toward
-            if screenPoints.count == 3 {
+            // Show dashed preview from last placed point back to first when 3 placed
+            if currentScreenPoints.count == 3 && visibilityFlags.allSatisfy({ $0 }) {
                 let preview = UIBezierPath()
-                preview.move(to: screenPoints.last!)
-                preview.addLine(to: screenPoints[0])
+                preview.move(to: currentScreenPoints[2])
+                preview.addLine(to: currentScreenPoints[0])
                 dashedPreviewLayer.path = preview.cgPath
             } else {
                 dashedPreviewLayer.path = nil
@@ -396,7 +450,6 @@ final class ManualWallSelector: UIView {
     }
 
     private func flashPolygonSuccess() {
-        // Brief pulse — fill goes brighter then back
         polygonLayer.fillColor = goldColor.withAlphaComponent(0.30).cgColor
         CATransaction.begin()
         CATransaction.setAnimationDuration(0.4)
@@ -426,14 +479,16 @@ final class ManualWallSelector: UIView {
     // MARK: - HitTest passthrough for restart button
 
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        // Let restart button receive its taps
         if !restartButton.isHidden,
            restartButton.alpha > 0,
            restartButton.frame.contains(point) {
             return restartButton
         }
-        // Everything else: this view captures the tap
         if isHidden { return nil }
         return self
+    }
+
+    deinit {
+        stopDisplayLink()
     }
 }

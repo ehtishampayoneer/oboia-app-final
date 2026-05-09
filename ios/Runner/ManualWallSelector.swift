@@ -159,6 +159,7 @@ final class ManualWallSelector: UIView {
     // MARK: - Public API
 
     func enter() {
+        slog("MANUAL", "enter() — sceneView=\(sceneView == nil ? "NIL" : "ok")")
         reset()
         isHidden = false
         UIView.animate(withDuration: 0.22) {
@@ -170,6 +171,7 @@ final class ManualWallSelector: UIView {
     }
 
     func exit() {
+        slog("MANUAL", "exit() — worldPoints captured=\(worldPoints.count)")
         stopDisplayLink()
         UIView.animate(withDuration: 0.18, animations: {
             self.instructionPill.alpha = 0
@@ -252,13 +254,22 @@ final class ManualWallSelector: UIView {
     // MARK: - Tap handling
 
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
-        guard worldPoints.count < 4 else { return }
-        guard let sceneView = sceneView else { return }
         let screenPoint = gesture.location(in: self)
+        slog("MANUAL", "handleTap at screen=(\(Int(screenPoint.x)),\(Int(screenPoint.y))) — current corners=\(worldPoints.count)/4")
+
+        guard worldPoints.count < 4 else {
+            slog("MANUAL", "handleTap IGNORED — already have 4 corners")
+            return
+        }
+        guard let sceneView = sceneView else {
+            slog("MANUAL", "handleTap FAILED — sceneView is nil")
+            return
+        }
 
         // Three-tier raycast strategy: existing plane → estimated plane → feature point
         var hitWorldPoint: SIMD3<Float>? = nil
         var hitNormal: SIMD3<Float>? = nil
+        var hitMethod: String = "none"
 
         if let q = sceneView.raycastQuery(from: screenPoint,
                                           allowing: .existingPlaneGeometry,
@@ -270,7 +281,7 @@ final class ManualWallSelector: UIView {
             hitNormal = SIMD3<Float>(r.worldTransform.columns.2.x,
                                      r.worldTransform.columns.2.y,
                                      r.worldTransform.columns.2.z)
-            NSLog("[AR] manual tap hit existingPlane")
+            hitMethod = "existingPlane"
         } else if let q = sceneView.raycastQuery(from: screenPoint,
                                                  allowing: .estimatedPlane,
                                                  alignment: .any),
@@ -281,23 +292,25 @@ final class ManualWallSelector: UIView {
             hitNormal = SIMD3<Float>(r.worldTransform.columns.2.x,
                                      r.worldTransform.columns.2.y,
                                      r.worldTransform.columns.2.z)
-            NSLog("[AR] manual tap hit estimatedPlane")
+            hitMethod = "estimatedPlane"
         } else {
             let hitTestResults = sceneView.hitTest(screenPoint, types: [.featurePoint])
             if let r = hitTestResults.first {
                 hitWorldPoint = SIMD3<Float>(r.worldTransform.columns.3.x,
                                              r.worldTransform.columns.3.y,
                                              r.worldTransform.columns.3.z)
-                NSLog("[AR] manual tap hit featurePoint")
+                hitMethod = "featurePoint"
             }
         }
 
         guard let world = hitWorldPoint else {
-            NSLog("[AR] manual tap MISSED — no surface")
+            slog("MANUAL", "handleTap MISSED — no surface found via any raycast strategy")
             delegate?.manualSelector(self, didFailWithReason: "Tap closer to the wall — point camera at it directly")
             flashRedDot(at: screenPoint)
             return
         }
+
+        slog("MANUAL", "handleTap HIT via \(hitMethod) world=(\(world.x),\(world.y),\(world.z))")
 
         worldPoints.append(world)
         currentScreenPoints.append(screenPoint)
@@ -311,7 +324,10 @@ final class ManualWallSelector: UIView {
         let gen = UIImpactFeedbackGenerator(style: .light)
         gen.impactOccurred()
 
+        slog("MANUAL", "corner \(worldPoints.count)/4 captured")
+
         if worldPoints.count == 4 {
+            slog("MANUAL", "all 4 corners captured — calling finalizePolygon")
             finalizePolygon(suggestedNormal: hitNormal)
         }
     }
@@ -319,7 +335,11 @@ final class ManualWallSelector: UIView {
     // MARK: - Polygon finalization
 
     private func finalizePolygon(suggestedNormal: SIMD3<Float>?) {
-        guard worldPoints.count == 4 else { return }
+        slog("MANUAL", "finalizePolygon BEGIN — worldPoints.count=\(worldPoints.count)")
+        guard worldPoints.count == 4 else {
+            slog("MANUAL", "finalizePolygon ABORT — not 4 points")
+            return
+        }
 
         let center = (worldPoints[0] + worldPoints[1] + worldPoints[2] + worldPoints[3]) / 4
 
@@ -339,7 +359,10 @@ final class ManualWallSelector: UIView {
             normal = -normal
         }
 
-        NSLog("[AR] manual finalize: w=\(width) h=\(height) center=\(center) normal=\(normal)")
+        slog("MANUAL", "finalizePolygon DIMS w=\(width) h=\(height)")
+        slog("MANUAL", "finalizePolygon CENTER=(\(center.x),\(center.y),\(center.z))")
+        slog("MANUAL", "finalizePolygon NORMAL=(\(normal.x),\(normal.y),\(normal.z))")
+        slog("MANUAL", "finalizePolygon — calling delegate didCompleteWithWorldPoints")
 
         let gen = UINotificationFeedbackGenerator()
         gen.notificationOccurred(.success)
@@ -353,6 +376,7 @@ final class ManualWallSelector: UIView {
             normal: normal
         )
 
+        slog("MANUAL", "finalizePolygon END — delegate returned")
         flashPolygonSuccess()
     }
 

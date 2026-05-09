@@ -288,6 +288,11 @@ class _ARScreenState extends State<ARScreen>
   Future<void> _onAREvent(AREvent e) async {
     debugPrint('[AR] event: ${e.type} data=${e.data}');
     switch (e.type) {
+      case 'boot':
+        // Native sends this on startup with the build tag.
+        debugPrint('[AR] NATIVE BOOTED build=${e.data["build"]}');
+        break;
+
       case 'wallDetected':
         final idx = e.wallIndex;
         if (idx == null || e.width == null || e.height == null) return;

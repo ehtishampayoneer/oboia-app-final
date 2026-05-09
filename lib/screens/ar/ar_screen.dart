@@ -18,6 +18,7 @@ import '../../services/ar_service.dart';
 import '../../services/texture_cache_service.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/debug_overlay.dart';
+import '../../widgets/scanning_overlay.dart';
 
 class ARScreen extends StatefulWidget {
   /// Optional wallpaper to open the screen with.
@@ -668,12 +669,13 @@ class _ARScreenState extends State<ARScreen>
           children: [
             _buildNativeARView(),
 
-            // Scanning overlay only shown when:
-            //  - no walls detected yet
-            //  - not in cut mode
-            //  - not in manual mode (native overlay handles that)
-            if (_walls.isEmpty && !_inCutMode && !_inManualMode)
-              _buildScanningOverlay(),
+            // Scanning overlay — always rendered so it can fade in/out smoothly.
+            // Fades out the moment any wall is captured (auto OR manual)
+            // or any other special mode is entered.
+            ScanningOverlay(
+              visible: _walls.isEmpty && !_inCutMode && !_inManualMode,
+              pointCount: 0,
+            ),
 
             // Top bar shown except in cut mode
             if (!_inCutMode) _buildTopBar(),
@@ -759,44 +761,9 @@ class _ARScreenState extends State<ARScreen>
     );
   }
 
-  Widget _buildScanningOverlay() {
-    return IgnorePointer(
-      child: Center(
-        child: AnimatedBuilder(
-          animation: _scanCtrl,
-          builder: (_, __) {
-            final t = _scanCtrl.value;
-            return Opacity(
-              opacity: 0.7 + 0.3 * t,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _DashedRectangle(
-                    size: Size(260 + 20 * t, 360 + 20 * t),
-                    color: AppTheme.gold,
-                  ),
-                  const SizedBox(height: 24),
-                  Text(
-                    'Point the camera at a wall',
-                    style:
-                        Theme.of(context).textTheme.titleMedium?.copyWith(
-                              color: Colors.white,
-                              shadows: const [
-                                Shadow(
-                                  blurRadius: 8,
-                                  color: Colors.black87,
-                                ),
-                              ],
-                            ),
-                  ),
-                ],
-              ),
-            );
-          },
-        ),
-      ),
-    );
-  }
+  // CHANGED: Old _buildScanningOverlay removed. The new ScanningOverlay widget
+  // is wired directly into the Stack in the build method above.
+  // _scanCtrl is kept for potential future use by other animated UI.
 
   // CHANGED: Always-available "Mark manually" pill near bottom of scanning view
   Widget _buildManualEntryButton() {

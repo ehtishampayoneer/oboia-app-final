@@ -179,6 +179,12 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         setupChannels()
         setupGestures()
         startSession()
+
+        // CHANGED: Boot beacon — confirms the latest native code is running.
+        // If you see this in the Flutter debug overlay, File 2 is live.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.sendEvent(type: "boot", data: ["build": "v1.3-manual-tracked"])
+        }
     }
 
     func view() -> UIView { return _view }

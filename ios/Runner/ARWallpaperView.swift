@@ -18,6 +18,51 @@ import SceneKit
 import Vision
 import Flutter
 
+// MARK: - Diagnostic Log (Swift-side)
+// Writes to Documents/oboia-debug.log in append mode, AND emits via NSLog.
+// Same file the Dart-side DiagnosticLog writes to, so logs interleave correctly.
+
+final class OboiaLog {
+    static let shared = OboiaLog()
+    private let queue = DispatchQueue(label: "com.oboia.log")
+    private lazy var fileURL: URL = {
+        let fm = FileManager.default
+        let dir = fm.urls(for: .documentDirectory, in: .userDomainMask).first!
+        return dir.appendingPathComponent("oboia-debug.log")
+    }()
+
+    func log(_ tag: String, _ message: String) {
+        let ts = OboiaLog.timestamp()
+        let line = "\(ts) [\(tag)] \(message)\n"
+        NSLog("[%@] %@", tag, message)
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            let url = self.fileURL
+            if let data = line.data(using: .utf8) {
+                if FileManager.default.fileExists(atPath: url.path) {
+                    if let handle = try? FileHandle(forWritingTo: url) {
+                        handle.seekToEndOfFile()
+                        handle.write(data)
+                        try? handle.close()
+                    }
+                } else {
+                    try? data.write(to: url)
+                }
+            }
+        }
+    }
+
+    private static func timestamp() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f.string(from: Date())
+    }
+}
+
+func slog(_ tag: String, _ message: String) {
+    OboiaLog.shared.log(tag, message)
+}
+
 // MARK: - Shared wallpaper descriptor
 
 struct WallpaperInfo {
@@ -171,7 +216,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         )
         super.init()
 
-        NSLog("[AR] init")
+        slog("AR-SWIFT", "ARWallpaperView init() — viewId=\(viewId)")
         setupARView()
         setupScene()
         setupCutOverlay()
@@ -180,10 +225,18 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         setupGestures()
         startSession()
 
-        // CHANGED: Boot beacon — confirms the latest native code is running.
-        // If you see this in the Flutter debug overlay, File 2 is live.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.sendEvent(type: "boot", data: ["build": "v1.3-manual-tracked"])
+        // Boot beacon — fires multiple times to maximize chance Dart catches it.
+        // Each fire is also written to the on-disk log, so even if the channel
+        // is broken we have proof native ran.
+        slog("AR-SWIFT", "scheduled boot beacons")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.sendEvent(type: "boot", data: ["build": "v2.0-diagnostic", "phase": "early"])
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.sendEvent(type: "boot", data: ["build": "v2.0-diagnostic", "phase": "mid"])
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            self?.sendEvent(type: "boot", data: ["build": "v2.0-diagnostic", "phase": "late"])
         }
     }
 
@@ -1407,18 +1460,26 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     // MARK: - Event channel
 
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        slog("AR-SWIFT", "onListen — Dart attached event listener")
         eventSink = events
         return nil
     }
 
     func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        slog("AR-SWIFT", "onCancel — Dart detached event listener")
         eventSink = nil
         return nil
     }
 
     private func sendEvent(type: String, data: [String: Any]) {
         DispatchQueue.main.async { [weak self] in
-            self?.eventSink?(["type": type, "data": data])
+            guard let self = self else { return }
+            if self.eventSink == nil {
+                slog("AR-SWIFT", "sendEvent type=\(type) DROPPED — eventSink is nil")
+            } else {
+                slog("AR-SWIFT", "sendEvent type=\(type) data=\(data)")
+            }
+            self.eventSink?(["type": type, "data": data])
         }
     }
 

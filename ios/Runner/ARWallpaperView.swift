@@ -4,13 +4,12 @@
 //
 //  Photorealistic AR wallpaper placement using ARKit + SceneKit PBR.
 //
-//  Phase 1 (May 2026):
-//   - Auto plane detection (works on textured walls)
-//   - MANUAL 4-corner tap mode (works on ANY wall, blank or textured)
-//   - Auto-fallback prompt: if plane detection finds nothing in 5 seconds
-//     and no wallpaper has been placed, suggest manual mode to Flutter
-//   - All previous Phase 0 features preserved (PBR, cut mode, lock,
-//     multi-wall, environment lighting)
+//  Phase 1.1 (May 2026):
+//   - Manual walls are now anchored via custom ARAnchor (no more drift)
+//   - PBR material is double-sided so wallpaper visible regardless of normal direction
+//   - Comprehensive [AR] debug logging for observability
+//   - Auto plane detection unchanged
+//   - All cut mode logic unchanged
 //
 
 import UIKit
@@ -34,9 +33,14 @@ struct WallpaperInfo {
 // MARK: - Per-wall state
 
 final class WallData {
-    /// nil for manual walls (they have no ARPlaneAnchor)
+    /// Plane anchor for AUTO-detected walls. nil for manual walls.
     let anchor: ARPlaneAnchor?
-    /// For manual walls: the world-space center, normal, and corner points
+
+    /// Custom ARAnchor for MANUAL walls — gives ARKit a tracking handle
+    /// so the wall stays glued to the world as tracking refines.
+    var manualARAnchor: ARAnchor?
+
+    /// Manual wall geometry (world coords at capture time, used for fallback math)
     let manualCenter: SIMD3<Float>?
     let manualNormal: SIMD3<Float>?
     let manualCorners: [SIMD3<Float>]?
@@ -51,11 +55,12 @@ final class WallData {
     let index: Int
     let isManual: Bool
 
-    /// Stable identifier for the cut tool (UUID for either source)
+    /// Stable identifier for cut tool indexing
     let id: UUID
 
     init(anchor: ARPlaneAnchor, markerNode: SCNNode, width: Float, height: Float, index: Int) {
         self.anchor = anchor
+        self.manualARAnchor = nil
         self.manualCenter = nil
         self.manualNormal = nil
         self.manualCorners = nil
@@ -67,9 +72,16 @@ final class WallData {
         self.id = anchor.identifier
     }
 
-    init(manualCenter: SIMD3<Float>, manualNormal: SIMD3<Float>, manualCorners: [SIMD3<Float>],
-         markerNode: SCNNode, width: Float, height: Float, index: Int) {
+    init(manualARAnchor: ARAnchor,
+         manualCenter: SIMD3<Float>,
+         manualNormal: SIMD3<Float>,
+         manualCorners: [SIMD3<Float>],
+         markerNode: SCNNode,
+         width: Float,
+         height: Float,
+         index: Int) {
         self.anchor = nil
+        self.manualARAnchor = manualARAnchor
         self.manualCenter = manualCenter
         self.manualNormal = manualNormal
         self.manualCorners = manualCorners
@@ -78,8 +90,20 @@ final class WallData {
         self.height = height
         self.index = index
         self.isManual = true
-        self.id = UUID()
+        self.id = manualARAnchor.identifier
     }
+}
+
+/// Pending state held between adding a manual ARAnchor to the session
+/// and ARKit calling renderer(didAdd:) for that anchor.
+private struct PendingManualWall {
+    let corners: [SIMD3<Float>]
+    let center: SIMD3<Float>
+    let normal: SIMD3<Float>
+    let width: Float
+    let height: Float
+    /// World→local rotation matrix (transpose of anchor rotation)
+    let worldToLocal: simd_float3x3
 }
 
 // MARK: - Main view
@@ -112,6 +136,10 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     private let manualSelector = ManualWallSelector(frame: .zero)
     private var inManualMode: Bool = false
 
+    /// Manual walls in flight — keyed by ARAnchor.identifier.
+    /// renderer(didAdd:) consumes entries from here.
+    private var pendingManualWalls: [UUID: PendingManualWall] = [:]
+
     // Auto-fallback timer
     private var autoFallbackTimer: Timer?
     private var sessionStartTime: TimeInterval = 0
@@ -143,6 +171,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         )
         super.init()
 
+        NSLog("[AR] init")
         setupARView()
         setupScene()
         setupCutOverlay()
@@ -234,16 +263,17 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
         sessionStartTime = CACurrentMediaTime()
         scheduleAutoFallback()
+        NSLog("[AR] session started")
     }
 
-    /// After 5 seconds, if no walls have been detected AND no wallpaper placed,
-    /// suggest manual mode to Flutter so it can show a prompt.
+    /// After 5 seconds, if no walls detected, suggest manual mode to Flutter.
     private func scheduleAutoFallback() {
         autoFallbackTimer?.invalidate()
         autoFallbackTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: false) { [weak self] _ in
             guard let self = self else { return }
             if self.walls.isEmpty && !self.hasEmittedManualSuggestion {
                 self.hasEmittedManualSuggestion = true
+                NSLog("[AR] auto-fallback suggesting manual mode")
                 self.sendEvent(type: "suggestManual", data: [
                     "reason": "no_planes_detected"
                 ])
@@ -311,26 +341,20 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
             sendEvent(type: "wallLockChanged", data: ["wallIndex": idx, "locked": locked])
             result(true)
 
-        // ── Manual mode handlers ────────────────────────────────────────
+        // ── Manual mode ─────────────────────────────────────────────────
         case "enterManualMode":
-            DispatchQueue.main.async { [weak self] in
-                self?.enterManualMode()
-            }
+            DispatchQueue.main.async { [weak self] in self?.enterManualMode() }
             result(true)
 
         case "exitManualMode":
-            DispatchQueue.main.async { [weak self] in
-                self?.exitManualMode()
-            }
+            DispatchQueue.main.async { [weak self] in self?.exitManualMode() }
             result(true)
 
         case "resetManual":
-            DispatchQueue.main.async { [weak self] in
-                self?.manualSelector.reset()
-            }
+            DispatchQueue.main.async { [weak self] in self?.manualSelector.reset() }
             result(true)
 
-        // ── Cut mode handlers ───────────────────────────────────────────
+        // ── Cut mode ────────────────────────────────────────────────────
         case "enterCutMode":
             guard let args = call.arguments as? [String: Any],
                   let idx = args["wallIndex"] as? Int,
@@ -424,6 +448,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     // MARK: - Manual mode
 
     private func enterManualMode() {
+        NSLog("[AR] entering manual mode")
         inManualMode = true
         manualSelector.isHidden = false
         manualSelector.enter()
@@ -431,6 +456,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     }
 
     private func exitManualMode() {
+        NSLog("[AR] exiting manual mode")
         inManualMode = false
         manualSelector.exit()
         sendEvent(type: "manualModeExited", data: [:])
@@ -444,65 +470,31 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
                         height: Float,
                         center: SIMD3<Float>,
                         normal: SIMD3<Float>) {
-        // Hide the selector overlay; we have geometry now
+        NSLog("[AR] manual selector completed: w=\(width) h=\(height) center=\(center) normal=\(normal)")
+
+        // Hide the selector overlay
         manualSelector.exit()
         inManualMode = false
 
-        let index = nextWallIndex
-        nextWallIndex += 1
+        // Build a transform whose translation = center, +Z = normal, +Y = world up
+        let (transform, worldToLocal) = makeWallTransform(center: center, normal: normal)
 
-        // FIXED: only build the visual marker. The wallpaper node is created
-        // later by attachWallpaper when the user actually picks a wallpaper.
-        // The previous version pre-created a dead "wallNode" that was added
-        // as a child of the marker but never used, leaving an orphan node.
-        let marker = makeManualWallMarker(
+        // Create a custom ARAnchor — ARKit will track this for us, eliminating drift.
+        let anchor = ARAnchor(name: "oboia.manualWall", transform: transform)
+
+        // Stash the data so renderer(didAdd:) can finish setup once ARKit creates the node.
+        pendingManualWalls[anchor.identifier] = PendingManualWall(
             corners: worldPoints,
             center: center,
             normal: normal,
             width: width,
             height: height,
-            selected: true
+            worldToLocal: worldToLocal
         )
 
-        let wall = WallData(
-            manualCenter: center,
-            manualNormal: normal,
-            manualCorners: worldPoints,
-            markerNode: marker,
-            width: width,
-            height: height,
-            index: index
-        )
-        // wallpaperNode stays nil until attachWallpaper runs.
-
-        // Add marker to scene
-        arView.scene.rootNode.addChildNode(marker)
-
-        // Deselect previously selected wall, select this one
-        if let prevId = selectedWallId, let prev = walls[prevId] {
-            prev.isSelected = false
-            updateMarkerAppearance(wall: prev, selected: false)
-        }
-        wall.isSelected = true
-        selectedWallId = wall.id
-
-        walls[wall.id] = wall
-        indexToWallId[index] = wall.id
-
-        sendEvent(type: "manualWallReady", data: [
-            "wallIndex": index,
-            "width": Double(width),
-            "height": Double(height),
-            "sqm": Double(width * height)
-        ])
-
-        // Also emit a wallDetected so the existing Flutter UI flows naturally
-        sendEvent(type: "wallDetected", data: [
-            "wallIndex": index,
-            "width": Double(width),
-            "height": Double(height),
-            "sqm": Double(width * height)
-        ])
+        // Add to session — triggers renderer(didAdd:) on the next frame.
+        arView.session.add(anchor: anchor)
+        NSLog("[AR] added manual ARAnchor id=\(anchor.identifier)")
     }
 
     func manualSelector(_ selector: ManualWallSelector, didAddCornerNumber n: Int) {
@@ -514,30 +506,70 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     }
 
     func manualSelector(_ selector: ManualWallSelector, didFailWithReason reason: String) {
+        NSLog("[AR] manual selector failed: \(reason)")
         sendEvent(type: "manualWallFailed", data: ["reason": reason])
     }
 
-    // MARK: - Manual wall geometry
+    // MARK: - Wall transform math
 
-    /// Build a visual marker outlining the manual wall corners (gold lines).
-    /// This is the only thing that lives in the scene until a wallpaper is picked.
-    private func makeManualWallMarker(
-        corners: [SIMD3<Float>],
-        center: SIMD3<Float>,
-        normal: SIMD3<Float>,
-        width: Float,
-        height: Float,
-        selected: Bool
-    ) -> SCNNode {
+    /// Build a 4x4 transform with:
+    ///   translation = center
+    ///   +Z axis    = normal (so children at identity face along the wall normal)
+    ///   +Y axis    = world up (gravity-aligned)
+    ///   +X axis    = right (perpendicular to both)
+    /// Also returns the world→local rotation (transpose of the rotation part).
+    private func makeWallTransform(center: SIMD3<Float>,
+                                   normal: SIMD3<Float>) -> (simd_float4x4, simd_float3x3) {
+        let z = simd_normalize(normal)
+        let worldUp = SIMD3<Float>(0, 1, 0)
+
+        let upDot = abs(simd_dot(z, worldUp))
+        let xAxis: SIMD3<Float>
+        let yAxis: SIMD3<Float>
+
+        if upDot > 0.99 {
+            // Wall normal nearly vertical — fall back to world right
+            xAxis = simd_normalize(simd_cross(SIMD3<Float>(1, 0, 0), z))
+            yAxis = simd_normalize(simd_cross(z, xAxis))
+        } else {
+            xAxis = simd_normalize(simd_cross(worldUp, z))
+            yAxis = simd_normalize(simd_cross(z, xAxis))
+        }
+
+        var t = matrix_identity_float4x4
+        t.columns.0 = SIMD4<Float>(xAxis, 0)
+        t.columns.1 = SIMD4<Float>(yAxis, 0)
+        t.columns.2 = SIMD4<Float>(z, 0)
+        t.columns.3 = SIMD4<Float>(center, 1)
+
+        // World→local rotation = transpose of [xAxis, yAxis, zAxis]
+        let worldToLocal = simd_float3x3(rows: [xAxis, yAxis, z])
+        return (t, worldToLocal)
+    }
+
+    /// Convert a world-space point into the wall's local frame, given the local origin (center)
+    /// and the world→local rotation.
+    private func toLocal(_ worldPoint: SIMD3<Float>,
+                         center: SIMD3<Float>,
+                         worldToLocal: simd_float3x3) -> SIMD3<Float> {
+        let offset = worldPoint - center
+        return worldToLocal * offset
+    }
+
+    // MARK: - Manual wall marker (in local coordinates)
+
+    /// Build a marker outlining the wall — positions in local space relative to the anchor.
+    /// All coordinates are anchor-local, so the marker stays glued to the wall
+    /// when ARKit refines tracking.
+    private func makeManualWallMarker(localCorners: [SIMD3<Float>], selected: Bool) -> SCNNode {
         let node = SCNNode()
         let color = selected ? goldColor : goldColor.withAlphaComponent(0.55)
 
-        // Draw lines between consecutive corners (forming the polygon outline)
-        for i in 0..<corners.count {
-            let a = corners[i]
-            let b = corners[(i + 1) % corners.count]
-            let segment = makeLineSegment(from: a, to: b, thickness: 0.006, color: color)
-            node.addChildNode(segment)
+        // Outline polygon connecting consecutive corners
+        for i in 0..<localCorners.count {
+            let a = localCorners[i]
+            let b = localCorners[(i + 1) % localCorners.count]
+            node.addChildNode(makeLineSegment(from: a, to: b, thickness: 0.006, color: color))
         }
 
         // Subtle pulse
@@ -548,7 +580,6 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         pulse.autoreverses = true
         pulse.repeatCount = .infinity
         node.addAnimation(pulse, forKey: "pulse")
-
         return node
     }
 
@@ -570,7 +601,6 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         let mid = (a + b) / 2
         node.simdPosition = mid
 
-        // Orient box height along the segment
         let up = SIMD3<Float>(0, 1, 0)
         let dir = simd_normalize(v)
         let dot = simd_dot(up, dir)
@@ -586,14 +616,17 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         return node
     }
 
-    // MARK: - Wallpaper placement (works for both auto and manual walls)
+    // MARK: - Wallpaper placement
 
     private func placeWallpaperFromArgs(_ args: [String: Any], result: @escaping FlutterResult) {
         guard let info = parseWallpaperInfo(args),
               let wallIndex = args["wallIndex"] as? Int else {
+            NSLog("[AR] placeWallpaper: bad args")
             result(FlutterError(code: "bad_args", message: "Missing wallpaper fields", details: nil))
             return
         }
+
+        NSLog("[AR] placeWallpaper request wallIndex=\(wallIndex) albedo=\(info.albedoUrl)")
 
         let wallId: UUID? = {
             if wallIndex >= 0, let id = indexToWallId[wallIndex] { return id }
@@ -602,6 +635,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         }()
 
         guard let id = wallId, let wall = walls[id] else {
+            NSLog("[AR] placeWallpaper: no wall available")
             result(FlutterError(code: "no_wall", message: "No wall available to place on", details: nil))
             return
         }
@@ -609,12 +643,14 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         loadPBRTextures(info: info) { [weak self] textures in
             guard let self = self else { return }
             guard let t = textures else {
+                NSLog("[AR] placeWallpaper: texture load FAILED")
                 DispatchQueue.main.async {
                     self.sendError(code: "texture_load", message: "Failed to load wallpaper image")
                     result(FlutterError(code: "texture_load", message: "Failed to load wallpaper image", details: nil))
                 }
                 return
             }
+            NSLog("[AR] placeWallpaper: textures loaded, attaching")
             DispatchQueue.main.async {
                 self.attachWallpaper(to: wall, textures: t, info: info)
                 self.sendEvent(type: "wallpaperPlaced", data: [
@@ -661,9 +697,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     }
 
     private func parseWallpaperInfo(_ args: [String: Any]) -> WallpaperInfo? {
-        guard let albedo = args["albedoUrl"] as? String, !albedo.isEmpty else {
-            return nil
-        }
+        guard let albedo = args["albedoUrl"] as? String, !albedo.isEmpty else { return nil }
         let normal = (args["normalUrl"] as? String) ?? ""
         let roughness = (args["roughnessUrl"] as? String) ?? ""
         let ao = (args["aoUrl"] as? String) ?? ""
@@ -698,36 +732,23 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         let cache = TextureCache.shared
 
         group.enter()
-        cache.loadImage(from: info.albedoUrl) { img in
-            albedo = img
-            group.leave()
-        }
+        cache.loadImage(from: info.albedoUrl) { img in albedo = img; group.leave() }
         if !info.normalUrl.isEmpty {
-            group.enter()
-            cache.loadImage(from: info.normalUrl) { img in
-                normal = img
-                group.leave()
-            }
+            group.enter(); cache.loadImage(from: info.normalUrl) { img in normal = img; group.leave() }
         }
         if !info.roughnessUrl.isEmpty {
-            group.enter()
-            cache.loadImage(from: info.roughnessUrl) { img in
-                rough = img
-                group.leave()
-            }
+            group.enter(); cache.loadImage(from: info.roughnessUrl) { img in rough = img; group.leave() }
         }
         if !info.aoUrl.isEmpty {
-            group.enter()
-            cache.loadImage(from: info.aoUrl) { img in
-                ao = img
-                group.leave()
-            }
+            group.enter(); cache.loadImage(from: info.aoUrl) { img in ao = img; group.leave() }
         }
 
         group.notify(queue: .global(qos: .userInitiated)) {
             guard let a = albedo else {
+                NSLog("[AR] loadPBR: albedo failed")
                 completion(nil); return
             }
+            NSLog("[AR] loadPBR: albedo OK (normal=\(normal != nil), roughness=\(rough != nil), ao=\(ao != nil))")
             completion(PBRTextures(albedo: a, normal: normal, roughness: rough, ao: ao))
         }
     }
@@ -742,35 +763,47 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
         let node = SCNNode(geometry: geometry)
         node.renderingOrder = 10
-        node.geometry?.firstMaterial?.writesToDepthBuffer = true
-        node.geometry?.firstMaterial?.readsFromDepthBuffer = true
 
         if wall.isManual {
-            // Position at wall center, oriented to face along the normal
-            node.simdPosition = wall.manualCenter ?? SIMD3<Float>(0, 0, 0)
-            if let n = wall.manualNormal {
-                // SCNPlane lies in XY plane with normal facing +Z by default.
-                // Rotate so its +Z aligns with the wall's normal.
-                let up = SIMD3<Float>(0, 0, 1)
-                let dot = simd_dot(up, n)
-                if abs(dot - 1.0) < 1e-4 {
-                    // already aligned
-                } else if abs(dot + 1.0) < 1e-4 {
-                    node.eulerAngles = SCNVector3(0, Float.pi, 0)
-                } else {
-                    let axis = simd_normalize(simd_cross(up, n))
-                    let angle = acos(dot)
-                    node.simdOrientation = simd_quaternion(angle, axis)
+            // Position at anchor origin (which is the wall center, with +Z = wall normal).
+            // SCNPlane lies in XY with normal = +Z, so identity local pose is exactly right.
+            node.simdPosition = SIMD3<Float>(0, 0, 0)
+            node.simdOrientation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+
+            if let anchor = wall.manualARAnchor, let anchorNode = arView.node(for: anchor) {
+                anchorNode.addChildNode(node)
+                NSLog("[AR] attachWallpaper: manual wall — attached to ARAnchor node OK")
+            } else {
+                // Fallback path — should never run if anchor was added correctly.
+                // Keeps the wallpaper visible somewhere sensible if ARKit hasn't yet
+                // produced a node for the anchor.
+                NSLog("[AR] attachWallpaper: manual wall — anchor node MISSING, using world fallback")
+                node.simdPosition = wall.manualCenter ?? SIMD3<Float>(0, 0, 0)
+                if let n = wall.manualNormal {
+                    let up = SIMD3<Float>(0, 0, 1)
+                    let dot = simd_dot(up, n)
+                    if abs(dot - 1.0) < 1e-4 { /* aligned */ }
+                    else if abs(dot + 1.0) < 1e-4 {
+                        node.eulerAngles = SCNVector3(0, Float.pi, 0)
+                    } else {
+                        let axis = simd_normalize(simd_cross(up, n))
+                        let angle = acos(dot)
+                        node.simdOrientation = simd_quaternion(angle, axis)
+                    }
                 }
+                arView.scene.rootNode.addChildNode(node)
             }
-            arView.scene.rootNode.addChildNode(node)
         } else {
-            // Auto-detected plane: child of the plane anchor's node so it tracks updates
+            // Auto-detected plane: child of the plane anchor's node so it tracks updates.
+            // SCNPlane lies in XY (normal +Z); ARPlaneAnchor's node has Y as plane normal,
+            // so we rotate -90° around X to align +Z of plane with +Y of anchor.
             node.eulerAngles = SCNVector3(-Float.pi / 2, 0, 0)
             if let anchor = wall.anchor, let planeNode = arView.node(for: anchor) {
                 node.simdPosition = anchor.center
                 planeNode.addChildNode(node)
+                NSLog("[AR] attachWallpaper: auto wall — attached to plane node OK")
             } else {
+                NSLog("[AR] attachWallpaper: auto wall — plane node MISSING")
                 arView.scene.rootNode.addChildNode(node)
             }
         }
@@ -782,14 +815,17 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         node.opacity = 1.0
         SCNTransaction.commit()
 
-        // If the wall already had a wallpaper node (replacing), remove the old one
+        // Replace previous wallpaper if any
         wall.wallpaperNode?.removeFromParentNode()
         wall.wallpaperNode = node
         wall.currentWallpaper = info
 
         cutTool.reapplyMask(toMaterial: material, wallId: wall.id)
 
+        // Hide marker outline once wallpaper is on (for unselected walls)
         wall.markerNode.opacity = wall.isSelected ? 1.0 : 0.0
+
+        NSLog("[AR] attachWallpaper: complete for wallIndex=\(wall.index) isManual=\(wall.isManual)")
     }
 
     private func updateMaterial(on wall: WallData, textures: PBRTextures, info: WallpaperInfo) {
@@ -856,7 +892,9 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         m.roughness.contentsTransform = transform
         m.ambientOcclusion.contentsTransform = transform
 
-        m.isDoubleSided = false
+        // CHANGED: double-sided so wallpaper visible regardless of camera angle relative to wall normal.
+        // Previously false caused silent invisibility when normal pointed away from user.
+        m.isDoubleSided = true
         return m
     }
 
@@ -887,7 +925,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         return anchor.extent.z
     }
 
-    // MARK: - Wall selection
+    // MARK: - Wall selection / clear
 
     private func selectWall(index: Int) {
         guard let id = indexToWallId[index] else { return }
@@ -914,10 +952,9 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
         if cutModeWallIndex != nil { return }
-        if inManualMode { return }   // manual selector handles its own taps
+        if inManualMode { return }
 
         let point = gesture.location(in: arView)
-
         guard let query = arView.raycastQuery(from: point,
                                               allowing: .existingPlaneGeometry,
                                               alignment: .vertical) else { return }
@@ -1088,13 +1125,68 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         sendEvent(type: "cutToolChanged", data: ["tool": tool.rawValue])
     }
 
-    // MARK: - ARSCNViewDelegate (auto plane lifecycle)
+    // MARK: - ARSCNViewDelegate (anchor lifecycle for AUTO planes AND MANUAL anchors)
 
     func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
+        // ── MANUAL wall path: our custom ARAnchor ─────────────────────────
+        if let pending = pendingManualWalls.removeValue(forKey: anchor.identifier) {
+            NSLog("[AR] renderer didAdd: manual ARAnchor — completing setup")
+
+            // Convert each world corner into the anchor's local frame
+            let localCorners: [SIMD3<Float>] = pending.corners.map {
+                toLocal($0, center: pending.center, worldToLocal: pending.worldToLocal)
+            }
+
+            let index = nextWallIndex
+            nextWallIndex += 1
+
+            let marker = makeManualWallMarker(localCorners: localCorners, selected: true)
+            // Marker is anchor-local — attach as child of the anchor's scene node.
+            node.addChildNode(marker)
+
+            let wall = WallData(
+                manualARAnchor: anchor,
+                manualCenter: pending.center,
+                manualNormal: pending.normal,
+                manualCorners: pending.corners,
+                markerNode: marker,
+                width: pending.width,
+                height: pending.height,
+                index: index
+            )
+
+            // Deselect previously selected, select this one
+            if let prevId = selectedWallId, let prev = walls[prevId] {
+                prev.isSelected = false
+                updateMarkerAppearance(wall: prev, selected: false)
+            }
+            wall.isSelected = true
+            selectedWallId = wall.id
+
+            walls[wall.id] = wall
+            indexToWallId[index] = wall.id
+
+            sendEvent(type: "manualWallReady", data: [
+                "wallIndex": index,
+                "width": Double(pending.width),
+                "height": Double(pending.height),
+                "sqm": Double(pending.width * pending.height)
+            ])
+            sendEvent(type: "wallDetected", data: [
+                "wallIndex": index,
+                "width": Double(pending.width),
+                "height": Double(pending.height),
+                "sqm": Double(pending.width * pending.height)
+            ])
+
+            NSLog("[AR] renderer didAdd: manual wall ready idx=\(index)")
+            return
+        }
+
+        // ── AUTO plane path: ARPlaneAnchor ────────────────────────────────
         guard let plane = anchor as? ARPlaneAnchor,
               plane.alignment == .vertical else { return }
 
-        // Cancel manual fallback timer — we got a wall
         autoFallbackTimer?.invalidate()
 
         let index = nextWallIndex
@@ -1120,6 +1212,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
             "height": Double(h),
             "sqm": Double(w * h)
         ])
+        NSLog("[AR] renderer didAdd: auto wall idx=\(index) w=\(w) h=\(h)")
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
@@ -1127,7 +1220,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
               plane.alignment == .vertical,
               let wall = walls[plane.identifier] else { return }
         if wall.isLocked { return }
-        if wall.isManual { return }   // manual walls don't track plane updates
+        if wall.isManual { return }
 
         let w = planeWidth(of: plane)
         let h = planeHeight(of: plane)
@@ -1167,6 +1260,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {
+        // Remove auto-detected wall (manual walls aren't auto-removed by ARKit)
         guard let plane = anchor as? ARPlaneAnchor,
               let wall = walls.removeValue(forKey: plane.identifier) else { return }
         indexToWallId.removeValue(forKey: wall.index)
@@ -1207,7 +1301,6 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         pulse.autoreverses = true
         pulse.repeatCount = .infinity
         parent.addAnimation(pulse, forKey: "pulse")
-
         return parent
     }
 
@@ -1243,14 +1336,17 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
+        NSLog("[AR] session failed: \(error.localizedDescription)")
         sendError(code: "session_failed", message: error.localizedDescription)
     }
 
     func sessionWasInterrupted(_ session: ARSession) {
+        NSLog("[AR] session interrupted")
         sendEvent(type: "sessionInterrupted", data: [:])
     }
 
     func sessionInterruptionEnded(_ session: ARSession) {
+        NSLog("[AR] session resumed")
         sendEvent(type: "sessionResumed", data: [:])
         if let cfg = session.configuration {
             session.run(cfg, options: [.resetTracking, .removeExistingAnchors])
@@ -1287,10 +1383,12 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     // MARK: - Disposal
 
     private func disposeAR() {
+        NSLog("[AR] dispose")
         autoFallbackTimer?.invalidate()
         arView.session.pause()
         walls.removeAll()
         indexToWallId.removeAll()
+        pendingManualWalls.removeAll()
         selectedWallId = nil
         arView.scene.rootNode.enumerateChildNodes { node, _ in node.removeFromParentNode() }
         eventSink = nil
@@ -1314,10 +1412,7 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
     private func sendEvent(type: String, data: [String: Any]) {
         DispatchQueue.main.async { [weak self] in
-            self?.eventSink?([
-                "type": type,
-                "data": data
-            ])
+            self?.eventSink?(["type": type, "data": data])
         }
     }
 

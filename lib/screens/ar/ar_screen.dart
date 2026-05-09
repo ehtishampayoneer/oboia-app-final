@@ -725,8 +725,54 @@ class _ARScreenState extends State<ARScreen>
               _buildManualSuggestionDialog(),
 
             const DebugOverlay(filter: '[AR]'),
+
+            // Diagnostic log viewer button — top-left under back button
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 70,
+              left: 16,
+              child: GestureDetector(
+                onTap: _openLogViewer,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.65),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: const Color(0xFFFFD369).withValues(alpha: 0.4),
+                      width: 1,
+                    ),
+                  ),
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.bug_report,
+                          size: 14, color: Color(0xFFFFD369)),
+                      SizedBox(width: 6),
+                      Text(
+                        'Show Logs',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           ],
         ),
+      ),
+    );
+  }
+
+  void _openLogViewer() {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => const _LogViewerScreen(),
+        fullscreenDialog: true,
       ),
     );
   }
@@ -925,8 +971,7 @@ class _ARScreenState extends State<ARScreen>
                               borderRadius: BorderRadius.circular(14),
                               boxShadow: [
                                 BoxShadow(
-                                  color: AppTheme.gold
-                                      .withValues(alpha: 0.4),
+                                  color: AppTheme.gold.withValues(alpha: 0.4),
                                   blurRadius: 12,
                                   offset: const Offset(0, 3),
                                 ),
@@ -1386,8 +1431,7 @@ class _ARScreenState extends State<ARScreen>
     }
 
     final m = _walls[sel]!;
-    final wp =
-        _wallpaperByWall[sel] ?? _pending ?? widget.initialWallpaper;
+    final wp = _wallpaperByWall[sel] ?? _pending ?? widget.initialWallpaper;
 
     if (wp == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1566,9 +1610,7 @@ class _ARScreenState extends State<ARScreen>
                   height: 14,
                   child: CircularProgressIndicator(
                     strokeWidth: 2,
-                    value: _preloadProgress == 0
-                        ? null
-                        : _preloadProgress,
+                    value: _preloadProgress == 0 ? null : _preloadProgress,
                     color: AppTheme.gold,
                   ),
                 ),
@@ -1995,4 +2037,184 @@ class _DashedPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _DashedPainter old) => old.color != color;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Diagnostic Log Viewer — fullscreen screen showing the in-memory ring
+// buffer. Copy button puts entire log on clipboard so user can paste.
+// ─────────────────────────────────────────────────────────────────────────
+
+class _LogViewerScreen extends StatefulWidget {
+  const _LogViewerScreen();
+
+  @override
+  State<_LogViewerScreen> createState() => _LogViewerScreenState();
+}
+
+class _LogViewerScreenState extends State<_LogViewerScreen> {
+  String _content = '';
+  bool _showFile = false;
+  bool _loading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadInMemory();
+  }
+
+  void _loadInMemory() {
+    setState(() {
+      _content = DiagnosticLog.instance.dump();
+      _showFile = false;
+    });
+  }
+
+  Future<void> _loadFile() async {
+    setState(() {
+      _loading = true;
+      _showFile = true;
+    });
+    final txt = await DiagnosticLog.instance.readFileLog();
+    if (!mounted) return;
+    setState(() {
+      _content = txt.isEmpty ? '(file is empty or not yet created)' : txt;
+      _loading = false;
+    });
+  }
+
+  Future<void> _copy() async {
+    await Clipboard.setData(ClipboardData(text: _content));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Logs copied to clipboard'),
+        duration: Duration(milliseconds: 1200),
+        backgroundColor: Colors.black87,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final lineCount = _content.isEmpty ? 0 : _content.split('\n').length;
+    return Scaffold(
+      backgroundColor: const Color(0xFF0A0A0A),
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        title: Text(
+          _showFile ? 'On-Disk Log' : 'In-Memory Log',
+          style: const TextStyle(color: Colors.white, fontSize: 16),
+        ),
+        iconTheme: const IconThemeData(color: Colors.white),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.copy, color: Color(0xFFFFD369)),
+            tooltip: 'Copy all',
+            onPressed: _copy,
+          ),
+          IconButton(
+            icon: const Icon(Icons.refresh, color: Colors.white),
+            tooltip: 'Refresh',
+            onPressed: _showFile ? _loadFile : _loadInMemory,
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // Mode switcher
+          Container(
+            color: Colors.black,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Row(
+              children: [
+                _ModeButton(
+                  label: 'Memory ($lineCount lines)',
+                  active: !_showFile,
+                  onTap: _loadInMemory,
+                ),
+                const SizedBox(width: 8),
+                _ModeButton(
+                  label: 'File',
+                  active: _showFile,
+                  onTap: _loadFile,
+                ),
+                const Spacer(),
+                Text(
+                  '$lineCount lines',
+                  style: const TextStyle(color: Colors.white54, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+
+          if (_loading)
+            const LinearProgressIndicator(
+              backgroundColor: Colors.black,
+              valueColor: AlwaysStoppedAnimation(Color(0xFFFFD369)),
+            ),
+
+          // Log content
+          Expanded(
+            child: Container(
+              color: const Color(0xFF0A0A0A),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(12),
+                child: SelectableText(
+                  _content.isEmpty ? '(no log entries yet)' : _content,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 11,
+                    fontFamily: 'Courier',
+                    height: 1.4,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ModeButton extends StatelessWidget {
+  final String label;
+  final bool active;
+  final VoidCallback onTap;
+
+  const _ModeButton({
+    required this.label,
+    required this.active,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+        decoration: BoxDecoration(
+          color: active
+              ? const Color(0xFFFFD369).withValues(alpha: 0.15)
+              : Colors.white.withValues(alpha: 0.05),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: active
+                ? const Color(0xFFFFD369)
+                : Colors.white.withValues(alpha: 0.2),
+            width: 1,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: active ? const Color(0xFFFFD369) : Colors.white70,
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+    );
+  }
 }

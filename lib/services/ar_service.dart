@@ -425,6 +425,40 @@ class ARService {
     dlog('AR-DART', 'disposeAR complete');
   }
 
+  // ── Phase 1: RoomPlan Scanning ─────────────────────────────────────────
+
+  /// Start a RoomPlan-driven scan. Native side will stream `scanUpdate`
+  /// events containing arrays of detected walls/doors/windows/objects.
+  Future<void> startScan() async {
+    dlog('AR-DART', 'startScan invoked');
+    await _channel.invokeMethod<void>('startScan');
+    dlog('AR-DART', 'startScan method returned');
+  }
+
+  /// Stop the current scan. Native fires `scanComplete` when post-processing
+  /// finishes — this method does NOT wait for that event.
+  Future<void> stopScan() async {
+    dlog('AR-DART', 'stopScan invoked');
+    try {
+      await _channel.invokeMethod<void>('stopScan');
+    } catch (_) {
+      // ignore — stopping a non-running scan is fine
+    }
+  }
+
+  /// Toggle whether a surface (wall/door/window) is excluded from wallpaper
+  /// application. The next scanUpdate event will reflect the new state.
+  Future<void> toggleSurfaceExclusion(String id) async {
+    dlog('AR-DART', 'toggleSurfaceExclusion id=$id');
+    await _channel.invokeMethod<void>('toggleSurfaceExclusion', {'id': id});
+  }
+
+  /// Toggle exclusion on a furniture object.
+  Future<void> toggleObjectExclusion(String id) async {
+    dlog('AR-DART', 'toggleObjectExclusion id=$id');
+    await _channel.invokeMethod<void>('toggleObjectExclusion', {'id': id});
+  }
+
   // ── Manual Mode Methods ────────────────────────────────────────────────
 
   Future<void> enterManualMode() async {

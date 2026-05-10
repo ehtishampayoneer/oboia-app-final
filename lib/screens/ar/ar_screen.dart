@@ -8,6 +8,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'scan_screen.dart';
 import 'package:provider/provider.dart';
 
 import '../../models/wallpaper_model.dart';
@@ -132,6 +133,13 @@ class _ARScreenState extends State<ARScreen>
     _sub = _ar.events.listen(_onAREvent);
     await _ar.initAR();
     debugPrint('[AR] boot: AR init done');
+
+    // Phase 1: kick off the scan flow as soon as AR is initialised.
+    // Defer to next frame so the AR screen has rendered its scaffold first.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _launchScanFlow();
+    });
 
     if (_currentShop == null) {
       debugPrint('[AR] boot: no shop — marking preload done');
@@ -308,9 +316,13 @@ class _ARScreenState extends State<ARScreen>
           // is no longer relevant.
           _showManualSuggestion = false;
         });
-        if (_pending != null && _wallpaperByWall[idx] == null) {
-          await _placeOn(idx, _pending!);
-        }
+        // Phase 1: auto-apply on wallDetected is DISABLED.
+        // Walls now come from RoomPlan via scan_screen.dart, and the user
+        // explicitly taps a wall to apply wallpaper (Patch 2 brings tap-select).
+        // The legacy auto-apply lived here — kept as a comment for traceability.
+        // if (_pending != null && _wallpaperByWall[idx] == null) {
+        //   await _placeOn(idx, _pending!);
+        // }
         break;
 
       case 'wallUpdated':
@@ -324,10 +336,12 @@ class _ARScreenState extends State<ARScreen>
             sqm: e.sqm ?? (e.width! * e.height!),
           );
         });
+        // Phase 1: auto-lock disabled. The user controls wall locking
+        // explicitly in the wallpaper-application UI (Phase 4).
         _autoLockTimers[idx]?.cancel();
-        if (_wallpaperByWall[idx] != null && _wallLocked[idx] != true) {
-          _scheduleAutoLock(idx);
-        }
+        // if (_wallpaperByWall[idx] != null && _wallLocked[idx] != true) {
+        //   _scheduleAutoLock(idx);
+        // }
         break;
 
       case 'wallSelected':
@@ -766,6 +780,34 @@ class _ARScreenState extends State<ARScreen>
         ),
       ),
     );
+  }
+
+  Future<void> _launchScanFlow() async {
+    debugPrint('[AR] launching scan flow');
+    final ScanSnapshot? snap = await Navigator.of(context).push<ScanSnapshot>(
+      MaterialPageRoute(
+        builder: (_) => const ScanScreen(),
+        fullscreenDialog: true,
+      ),
+    );
+    if (!mounted) return;
+
+    if (snap == null) {
+      debugPrint('[AR] scan returned no snapshot — user cancelled');
+      // User backed out without finishing. Pop the AR screen entirely.
+      Navigator.of(context).maybePop();
+      return;
+    }
+
+    debugPrint('[AR] scan complete: walls=${snap.wallCount} doors=${snap.doorCount} windows=${snap.windowCount}');
+    // Phase 1: switch native AR into preview mode so it stops listening
+    // to ARKit plane detection. Phase 2 will use the snapshot's surfaces
+    // to render outlines and accept tap-to-apply gestures.
+    try {
+      await _ar.setARMode('preview');
+    } catch (e) {
+      debugPrint('[AR] setARMode failed: $e');
+    }
   }
 
   void _openLogViewer() {

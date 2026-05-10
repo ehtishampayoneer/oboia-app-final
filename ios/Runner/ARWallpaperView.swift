@@ -13,6 +13,7 @@
 //
 
 import UIKit
+import RoomPlan
 import ARKit
 import SceneKit
 import Vision
@@ -182,6 +183,23 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     private var inManualMode: Bool = false
 
     private var pendingManualWalls: [UUID: PendingManualWall] = [:]
+
+    // MARK: - Phase 1: Room scanner (RoomPlan)
+    //
+    // Lazy-initialised because RoomScanController is iOS 17+ only. We only
+    // create it when scanning is actually requested.
+    private var _roomScanController: AnyObject?
+
+    @available(iOS 17.0, *)
+    private var roomScanController: RoomScanController {
+        if let existing = _roomScanController as? RoomScanController {
+            return existing
+        }
+        let controller = RoomScanController()
+        controller.delegate = self
+        _roomScanController = controller
+        return controller
+    }
 
     // MARK: - Phase 1: Scan/Preview mode
     //
@@ -378,6 +396,72 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
             slog("AR-SWIFT", "setARMode -> \(modeStr)")
             sendEvent(type: "arModeChanged", data: ["mode": modeStr])
             result(nil)
+            return
+
+        case "startScan":
+            if #available(iOS 17.0, *) {
+                guard RoomScanController.isDeviceSupported else {
+                    result(FlutterError(code: "DEVICE_UNSUPPORTED",
+                                        message: "This iPhone doesn't have LiDAR. OBOIA scanning requires iPhone Pro models.",
+                                        details: nil))
+                    return
+                }
+                slog("AR-SWIFT", "startScan invoked — passing shared ARSession to RoomScanController")
+                roomScanController.startScan(arSession: arView.session)
+                result(nil)
+            } else {
+                result(FlutterError(code: "OS_UNSUPPORTED",
+                                    message: "iOS 17 or later is required for room scanning.",
+                                    details: nil))
+            }
+            return
+
+        case "stopScan":
+            if #available(iOS 17.0, *) {
+                slog("AR-SWIFT", "stopScan invoked")
+                roomScanController.stopScan()
+                result(nil)
+            } else {
+                result(nil)
+            }
+            return
+
+        case "toggleSurfaceExclusion":
+            if #available(iOS 17.0, *) {
+                guard let args = call.arguments as? [String: Any],
+                      let idStr = args["id"] as? String,
+                      let id = UUID(uuidString: idStr) else {
+                    result(FlutterError(code: "BAD_ARGS",
+                                        message: "toggleSurfaceExclusion requires {id: UUID}",
+                                        details: nil))
+                    return
+                }
+                roomScanController.toggleSurfaceExclusion(id: id)
+                result(nil)
+            } else {
+                result(FlutterError(code: "OS_UNSUPPORTED",
+                                    message: "iOS 17 or later required.",
+                                    details: nil))
+            }
+            return
+
+        case "toggleObjectExclusion":
+            if #available(iOS 17.0, *) {
+                guard let args = call.arguments as? [String: Any],
+                      let idStr = args["id"] as? String,
+                      let id = UUID(uuidString: idStr) else {
+                    result(FlutterError(code: "BAD_ARGS",
+                                        message: "toggleObjectExclusion requires {id: UUID}",
+                                        details: nil))
+                    return
+                }
+                roomScanController.toggleObjectExclusion(id: id)
+                result(nil)
+            } else {
+                result(FlutterError(code: "OS_UNSUPPORTED",
+                                    message: "iOS 17 or later required.",
+                                    details: nil))
+            }
             return
 
         case "initAR":
@@ -860,8 +944,6 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         node.renderingOrder = 10
 
         if wall.isManual {
-            // Position at anchor origin (which is the wall center, with +Z = wall normal).
-            // SCNPlane lies in XY with normal = +Z, so identity local pose is exactly right.
             node.simdPosition = SIMD3<Float>(0, 0, 0)
             node.simdOrientation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
 
@@ -869,9 +951,6 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
                 anchorNode.addChildNode(node)
                 NSLog("[AR] attachWallpaper: manual wall — attached to ARAnchor node OK")
             } else {
-                // Fallback path — should never run if anchor was added correctly.
-                // Keeps the wallpaper visible somewhere sensible if ARKit hasn't yet
-                // produced a node for the anchor.
                 NSLog("[AR] attachWallpaper: manual wall — anchor node MISSING, using world fallback")
                 node.simdPosition = wall.manualCenter ?? SIMD3<Float>(0, 0, 0)
                 if let n = wall.manualNormal {
@@ -889,9 +968,6 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
                 arView.scene.rootNode.addChildNode(node)
             }
         } else {
-            // Auto-detected plane: child of the plane anchor's node so it tracks updates.
-            // SCNPlane lies in XY (normal +Z); ARPlaneAnchor's node has Y as plane normal,
-            // so we rotate -90° around X to align +Z of plane with +Y of anchor.
             node.eulerAngles = SCNVector3(-Float.pi / 2, 0, 0)
             if let anchor = wall.anchor, let planeNode = arView.node(for: anchor) {
                 node.simdPosition = anchor.center
@@ -903,21 +979,18 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
             }
         }
 
-        // Fade in
         node.opacity = 0.0
         SCNTransaction.begin()
         SCNTransaction.animationDuration = 0.25
         node.opacity = 1.0
         SCNTransaction.commit()
 
-        // Replace previous wallpaper if any
         wall.wallpaperNode?.removeFromParentNode()
         wall.wallpaperNode = node
         wall.currentWallpaper = info
 
         cutTool.reapplyMask(toMaterial: material, wallId: wall.id)
 
-        // Hide marker outline once wallpaper is on (for unselected walls)
         wall.markerNode.opacity = wall.isSelected ? 1.0 : 0.0
 
         NSLog("[AR] attachWallpaper: complete for wallIndex=\(wall.index) isManual=\(wall.isManual)")
@@ -1227,7 +1300,6 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         if let pending = pendingManualWalls.removeValue(forKey: anchor.identifier) {
             NSLog("[AR] renderer didAdd: manual ARAnchor — completing setup")
 
-            // Convert each world corner into the anchor's local frame
             let localCorners: [SIMD3<Float>] = pending.corners.map {
                 toLocal($0, center: pending.center, worldToLocal: pending.worldToLocal)
             }
@@ -1236,7 +1308,6 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
             nextWallIndex += 1
 
             let marker = makeManualWallMarker(localCorners: localCorners, selected: true)
-            // Marker is anchor-local — attach as child of the anchor's scene node.
             node.addChildNode(marker)
 
             let wall = WallData(
@@ -1250,7 +1321,6 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
                 index: index
             )
 
-            // Deselect previously selected, select this one
             if let prevId = selectedWallId, let prev = walls[prevId] {
                 prev.isSelected = false
                 updateMarkerAppearance(wall: prev, selected: false)
@@ -1362,7 +1432,6 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didRemove node: SCNNode, for anchor: ARAnchor) {
-        // Remove auto-detected wall (manual walls aren't auto-removed by ARKit)
         guard let plane = anchor as? ARPlaneAnchor,
               let wall = walls.removeValue(forKey: plane.identifier) else { return }
         indexToWallId.removeValue(forKey: wall.index)
@@ -1528,5 +1597,71 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
     private func sendError(code: String, message: String) {
         sendEvent(type: "error", data: ["code": code, "message": message])
+    }
+}
+
+// MARK: - RoomScanControllerDelegate (Phase 1)
+
+@available(iOS 17.0, *)
+extension ARWallpaperView: RoomScanControllerDelegate {
+
+    func roomScanDidStart(_ controller: RoomScanController) {
+        slog("AR-SWIFT", "roomScanDidStart — surfaces will stream in")
+        sendEvent(type: "scanStarted", data: [:])
+    }
+
+    func roomScan(_ controller: RoomScanController,
+                  didUpdate snapshot: ScanSnapshot) {
+        sendEvent(type: "scanUpdate", data: snapshotToMap(snapshot))
+    }
+
+    func roomScan(_ controller: RoomScanController,
+                  didFinishWith snapshot: ScanSnapshot) {
+        slog("AR-SWIFT", "roomScan didFinish — surfaces=\(snapshot.surfaces.count) objects=\(snapshot.objects.count)")
+        sendEvent(type: "scanComplete", data: snapshotToMap(snapshot))
+    }
+
+    func roomScan(_ controller: RoomScanController, didFailWith error: Error) {
+        slog("AR-SWIFT", "roomScan didFailWith: \(error.localizedDescription)")
+        sendEvent(type: "scanFailed", data: ["message": error.localizedDescription])
+    }
+
+    func roomScan(_ controller: RoomScanController,
+                  instructionChangedTo instruction: RoomCaptureSession.Instruction) {
+        sendEvent(type: "scanInstruction", data: ["instruction": "\(instruction)"])
+    }
+
+    // MARK: helpers
+
+    private func snapshotToMap(_ snapshot: ScanSnapshot) -> [String: Any] {
+        return [
+            "isFinal": snapshot.isFinal,
+            "surfaces": snapshot.surfaces.map { surfaceToMap($0) },
+            "objects": snapshot.objects.map { objectToMap($0) },
+        ]
+    }
+
+    private func surfaceToMap(_ s: DetectedSurface) -> [String: Any] {
+        return [
+            "id": s.id.uuidString,
+            "kind": s.kind.rawValue,
+            "width": Double(s.width),
+            "height": Double(s.height),
+            "sqm": Double(s.sqm),
+            "confidence": Double(s.confidence),
+            "isExcluded": s.isExcluded,
+        ]
+    }
+
+    private func objectToMap(_ o: DetectedObject) -> [String: Any] {
+        return [
+            "id": o.id.uuidString,
+            "category": o.category,
+            "width": Double(o.dimensions.x),
+            "height": Double(o.dimensions.y),
+            "depth": Double(o.dimensions.z),
+            "confidence": Double(o.confidence),
+            "isExcluded": o.isExcluded,
+        ]
     }
 }

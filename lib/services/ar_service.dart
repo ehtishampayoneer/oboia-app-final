@@ -271,7 +271,6 @@ class ARService {
     dlog('AR-DART', 'initAR() called, _initialized=$_initialized');
     if (_initialized) {
       dlog('AR-DART', 'initAR() already initialized — ensuring listener still attached');
-      // If a previous instance disposed the eventSub, re-attach it.
       if (_eventSub == null) {
         _attachEventChannel();
       }
@@ -279,10 +278,12 @@ class ARService {
     }
     _initialized = true;
 
-    _attachEventChannel();
-
+    // CRITICAL: invoke initAR method FIRST. This forces the native side
+    // to be ready. Then wait a brief moment for the platform view to
+    // finish setting up its EventChannel stream handler. THEN attach
+    // the Dart listener — this guarantees Swift's onListen fires.
     try {
-      dlog('AR-DART', 'invoking initAR method on channel');
+      dlog('AR-DART', 'invoking initAR method on channel (before event channel attach)');
       await _channel.invokeMethod<void>('initAR');
       dlog('AR-DART', 'initAR method returned successfully');
     } on PlatformException catch (e) {
@@ -291,7 +292,17 @@ class ARService {
         type: 'error',
         data: {'code': e.code, 'message': e.message ?? ''},
       ));
+      return;
     }
+
+    // Wait one frame so that the UiKitView has been built and ARWallpaperView.init()
+    // has run its setupChannels(), which calls eventChannel.setStreamHandler(self).
+    // Without this delay, the Dart subscription happens before Swift registers
+    // the stream handler, and the connection is silently lost.
+    await Future.delayed(const Duration(milliseconds: 800));
+
+    dlog('AR-DART', 'attaching event channel listener (after native ready)');
+    _attachEventChannel();
   }
 
   void _attachEventChannel() {

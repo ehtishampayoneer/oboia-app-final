@@ -55,6 +55,7 @@
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arkit</string>
+<string>iphone-ipad-minimum-performance-a12</string>
 	</array>
 	<key>CFBundleURLTypes</key>
 	<array>

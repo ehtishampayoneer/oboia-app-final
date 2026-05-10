@@ -181,9 +181,22 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
     private let manualSelector = ManualWallSelector(frame: .zero)
     private var inManualMode: Bool = false
 
-    /// Manual walls in flight — keyed by ARAnchor.identifier.
-    /// renderer(didAdd:) consumes entries from here.
     private var pendingManualWalls: [UUID: PendingManualWall] = [:]
+
+    // MARK: - Phase 1: Scan/Preview mode
+    //
+    // .scanning  → RoomPlan is actively detecting walls. Do NOT auto-create
+    //              wallpaper nodes for ARPlaneAnchors. UI shows scan coaching.
+    // .preview   → User finished scanning. Walls come from RoomPlan results
+    //              (pushed in via separate API). User taps to apply wallpaper.
+    // .legacy    → Old behavior (auto-apply on plane detection). Kept as a
+    //              fallback flag in case we need to roll back; default OFF.
+    enum ARMode {
+        case scanning
+        case preview
+        case legacy
+    }
+    private var arMode: ARMode = .scanning
 
     // Auto-fallback timer
     private var autoFallbackTimer: Timer?
@@ -344,6 +357,29 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
     private func handleMethodCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
+        case "setARMode":
+            guard let args = call.arguments as? [String: Any],
+                  let modeStr = args["mode"] as? String else {
+                result(FlutterError(code: "BAD_ARGS",
+                                    message: "setARMode requires {mode: scanning|preview|legacy}",
+                                    details: nil))
+                return
+            }
+            switch modeStr {
+            case "scanning": arMode = .scanning
+            case "preview":  arMode = .preview
+            case "legacy":   arMode = .legacy
+            default:
+                result(FlutterError(code: "BAD_MODE",
+                                    message: "Unknown mode '\(modeStr)'",
+                                    details: nil))
+                return
+            }
+            slog("AR-SWIFT", "setARMode -> \(modeStr)")
+            sendEvent(type: "arModeChanged", data: ["mode": modeStr])
+            result(nil)
+            return
+
         case "initAR":
             result(true)
 
@@ -1245,6 +1281,13 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
         // ── AUTO plane path: ARPlaneAnchor ────────────────────────────────
         guard let plane = anchor as? ARPlaneAnchor,
               plane.alignment == .vertical else { return }
+
+        // Phase 1: only the legacy mode auto-creates walls from ARKit planes.
+        // In scanning/preview mode, walls come from RoomPlan, not ARKit.
+        guard arMode == .legacy else {
+            slog("AR-SWIFT", "ARPlaneAnchor ignored — arMode=\(arMode)")
+            return
+        }
 
         autoFallbackTimer?.invalidate()
 

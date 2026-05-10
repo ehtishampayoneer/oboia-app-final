@@ -459,6 +459,15 @@ class ARService {
     await _channel.invokeMethod<void>('toggleObjectExclusion', {'id': id});
   }
 
+  /// Switch native AR mode. Valid values: 'scanning', 'preview', 'legacy'.
+  /// - scanning: ARKit auto-plane detection ignored; RoomPlan active.
+  /// - preview:  scan complete; user taps walls to apply wallpaper.
+  /// - legacy:   old behavior (auto-apply on plane detection). For testing.
+  Future<void> setARMode(String mode) async {
+    dlog('AR-DART', 'setARMode -> $mode');
+    await _channel.invokeMethod<void>('setARMode', {'mode': mode});
+  }
+
   // ── Manual Mode Methods ────────────────────────────────────────────────
 
   Future<void> enterManualMode() async {

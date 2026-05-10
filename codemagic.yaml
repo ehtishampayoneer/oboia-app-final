@@ -35,7 +35,9 @@ workflows:
             'ARWallpaperViewFactory.swift',
             'TextureCache.swift',
             'WallpaperCutTool.swift',
-            'CutModeOverlay.swift'
+            'CutModeOverlay.swift',
+            'ManualWallSelector.swift',
+            'RoomScanController.swift'
           ]
           files.each do |filename|
             unless group.files.any? { |f| f.path == filename }

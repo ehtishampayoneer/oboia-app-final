@@ -47,7 +47,7 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>OBOIA needs the camera so you can preview wallpapers on your walls in AR.</string>
+	<string>OBOIA uses the camera and LiDAR to scan your room, identify walls and openings, and let you preview wallpapers in AR.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>OBOIA needs access to your photos so you can set a profile picture.</string>
 	<key>NSMicrophoneUsageDescription</key>
@@ -68,6 +68,6 @@
 		</dict>
 	</array>
 	<key>MinimumOSVersion</key>
-	<string>16.0</string>
+	<string>17.0</string>
 </dict>
 </plist>

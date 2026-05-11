@@ -22,6 +22,8 @@
 	<string>????</string>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>17.0</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>
@@ -55,7 +57,7 @@
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arkit</string>
-<string>iphone-ipad-minimum-performance-a12</string>
+		<string>iphone-ipad-minimum-performance-a12</string>
 	</array>
 	<key>CFBundleURLTypes</key>
 	<array>
@@ -68,7 +70,5 @@
 			</array>
 		</dict>
 	</array>
-	<key>MinimumOSVersion</key>
-	<string>17.0</string>
 </dict>
 </plist>

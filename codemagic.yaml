@@ -37,7 +37,7 @@ workflows:
             'WallpaperCutTool.swift',
             'CutModeOverlay.swift',
             'ManualWallSelector.swift',
-            'RoomScanController.swift'
+            'RoomScanner.swift'
           ]
           files.each do |filename|
             unless group.files.any? { |f| f.path == filename }

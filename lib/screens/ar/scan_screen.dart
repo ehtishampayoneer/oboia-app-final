@@ -1,11 +1,12 @@
 // lib/screens/ar/scan_screen.dart
 // OBOIA — Room scanning UI (Phase 1)
-// Shows live LiDAR scan updates, surface list, and Done button.
 
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../../services/ar_service.dart';
+
+const Color goldColor = Color(0xFFFFD369);
 
 class ScanScreen extends StatefulWidget {
   const ScanScreen({super.key});
@@ -17,8 +18,6 @@ class ScanScreen extends StatefulWidget {
 class _ScanScreenState extends State<ScanScreen> {
   final ARService _arService = ARService.instance;
   StreamSubscription<AREvent>? _eventSub;
-
-  // Latest scan snapshot (from native)
   List<DetectedSurface> _surfaces = [];
   List<DetectedObject> _objects = [];
   bool _isScanning = false;
@@ -31,10 +30,7 @@ class _ScanScreenState extends State<ScanScreen> {
 
   Future<void> _startScan() async {
     setState(() => _isScanning = true);
-    // Listen to events
     _eventSub = _arService.events.listen(_onAREvent);
-
-    // Begin RoomPlan scan
     await _arService.setARMode('scanning');
     await _arService.startScan();
   }
@@ -55,19 +51,16 @@ class _ScanScreenState extends State<ScanScreen> {
       }
     } else if (event.type == 'scanComplete') {
       setState(() => _isScanning = false);
-      // Optionally pop back with snapshot data
       Navigator.of(context).pop(_surfaces);
     }
   }
 
   Future<void> _stopScan() async {
     await _arService.stopScan();
-    // The scanComplete event will pop the screen
   }
 
   void _toggleSurfaceExclusion(String id) {
     _arService.toggleSurfaceExclusion(id);
-    // We'll rely on the next scanUpdate to update UI
   }
 
   @override
@@ -83,10 +76,6 @@ class _ScanScreenState extends State<ScanScreen> {
       body: SafeArea(
         child: Stack(
           children: [
-            // Camera preview is already shown by the native UiKitView behind this route.
-            // This screen is semi-transparent to overlay info.
-
-            // Top: coaching message
             Positioned(
               top: 32,
               left: 16,
@@ -103,8 +92,6 @@ class _ScanScreenState extends State<ScanScreen> {
                       textAlign: TextAlign.center,
                     ),
             ),
-
-            // Bottom: surface list
             Positioned(
               bottom: 120,
               left: 0,
@@ -119,7 +106,7 @@ class _ScanScreenState extends State<ScanScreen> {
                     return ListTile(
                       leading: Icon(
                         _iconForType(surface.type),
-                        color: isExcluded ? Colors.grey : Colors.gold,
+                        color: isExcluded ? Colors.grey : goldColor,
                       ),
                       title: Text(
                         '${surface.type} ${index + 1}',
@@ -135,22 +122,20 @@ class _ScanScreenState extends State<ScanScreen> {
                       trailing: Switch(
                         value: !isExcluded,
                         onChanged: (_) => _toggleSurfaceExclusion(surface.id),
-                        activeColor: Colors.gold,
+                        activeColor: goldColor,
                       ),
                     );
                   },
                 ),
               ),
             ),
-
-            // Done button
             Positioned(
               bottom: 48,
               left: 40,
               right: 40,
               child: ElevatedButton(
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: _isScanning ? Colors.grey : Colors.gold,
+                  backgroundColor: _isScanning ? Colors.grey : goldColor,
                   padding: const EdgeInsets.symmetric(vertical: 16),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
                 ),
@@ -178,7 +163,6 @@ class _ScanScreenState extends State<ScanScreen> {
   }
 }
 
-// Simple model classes for the UI (mirrors native DetectedSurface/DetectedObject)
 class DetectedSurface {
   final String id;
   final String type;

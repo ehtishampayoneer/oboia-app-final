@@ -3,10 +3,17 @@
 //  OBOIA
 //
 //  Wraps Apple's RoomCaptureSession (RoomPlan) to detect real walls, doors,
-//  windows, openings, and furniture using LiDAR. Emits structured updates
-//  that the rest of the AR stack consumes.
+//  windows, openings, and furniture using LiDAR.
 //
-//  Requires: iOS 17.0+ (custom ARSession support via RoomCaptureSession init)
+//  IMPORTANT ARCHITECTURE NOTE (Patch 2.1):
+//  This controller OWNS its ARSession. It creates RoomCaptureSession() with
+//  no parameters (default init), which gives it an internal ARSession that
+//  RoomPlan fully controls. Callers (e.g. ARWallpaperView) should ADOPT this
+//  ARSession by assigning it to their ARSCNView.session property. This avoids
+//  the "Capture scene exceeded limit" error that happens when RoomPlan
+//  receives a pre-configured external ARSession.
+//
+//  Requires: iOS 17.0+
 //  Requires: LiDAR-capable device (iPhone 12 Pro and later)
 //
 
@@ -17,7 +24,6 @@ import simd
 
 // MARK: - Public data model
 
-/// A single architectural surface (wall, door, window, opening) found by RoomPlan.
 struct DetectedSurface {
     enum Kind: String {
         case wall
@@ -26,36 +32,30 @@ struct DetectedSurface {
         case opening
     }
 
-    let id: UUID                 // RoomPlan's stable Surface.identifier
+    let id: UUID
     let kind: Kind
-    let width: Float             // metres
-    let height: Float            // metres
-    let transform: simd_float4x4 // world-space transform of surface center
-    let confidence: Float        // 0..1
-
-    /// User-controlled exclusion flag. Walls default to false (included),
-    /// doors/windows/openings default to true (excluded from wallpaper).
+    let width: Float
+    let height: Float
+    let transform: simd_float4x4
+    let confidence: Float
     var isExcluded: Bool
 
     var sqm: Float { width * height }
 }
 
-/// A free-standing object found by RoomPlan (sofa, TV, painting, etc).
 struct DetectedObject {
     let id: UUID
-    let category: String         // e.g. "sofa", "television", "table"
-    let dimensions: SIMD3<Float> // width, height, depth in metres
+    let category: String
+    let dimensions: SIMD3<Float>
     let transform: simd_float4x4
     let confidence: Float
-
-    var isExcluded: Bool         // default true — never wallpaper objects
+    var isExcluded: Bool
 }
 
-/// What gets emitted on each scan progress tick.
 struct ScanSnapshot {
     let surfaces: [DetectedSurface]
     let objects: [DetectedObject]
-    let isFinal: Bool            // true only on completion
+    let isFinal: Bool
 }
 
 // MARK: - Delegate protocol
@@ -78,62 +78,59 @@ final class RoomScanController: NSObject {
 
     weak var delegate: RoomScanControllerDelegate?
 
-    /// True while a scan is active.
     private(set) var isScanning: Bool = false
-
-    /// Most recent merged scan result. Kept around so wallpaper preview
-    /// can read final wall geometry after the user stops scanning.
     private(set) var latestSnapshot: ScanSnapshot?
 
-    /// Hardware capability check. Call before attempting startScan.
     static var isDeviceSupported: Bool {
         return RoomCaptureSession.isSupported
     }
 
+    /// The ARSession that RoomPlan owns. Callers should adopt this on their
+    /// ARSCNView while scanning is active (e.g. `arView.session = controller.arSession`).
+    var arSession: ARSession {
+        return captureSession.arSession
+    }
+
     // MARK: Private — RoomPlan
 
-    /// Lazily created once we have an ARSession (passed in via startScan).
-    /// RoomCaptureSession takes its ARSession at INIT time, not at run().
-    private var captureSession: RoomCaptureSession?
+    /// IMPORTANT: created with NO arguments. Default init() means RoomPlan
+    /// creates and fully controls its own internal ARSession. This is what
+    /// makes the scan work — RoomPlan needs to own the ARSession, not adopt
+    /// an externally-configured one.
+    private let captureSession = RoomCaptureSession()
 
-    /// RoomBuilder reprocesses raw CapturedRoomData into a final CapturedRoom
-    /// at the end of a scan. Heavy operation — only used in didEndWith.
     private let roomBuilder = RoomBuilder(options: [.beautifyObjects])
 
     private let captureConfig: RoomCaptureSession.Configuration = {
         var cfg = RoomCaptureSession.Configuration()
-        cfg.isCoachingEnabled = false   // we render our own coaching UI in Flutter
+        cfg.isCoachingEnabled = false
         return cfg
     }()
 
-    /// User exclusion overrides keyed by surface UUID. Survives across
-    /// scan progress updates so the user's tap-to-toggle decisions persist.
     private var surfaceExclusionOverrides: [UUID: Bool] = [:]
     private var objectExclusionOverrides: [UUID: Bool] = [:]
-
-    /// Strong reference to the ARSession we share with ARWallpaperView.
-    private weak var sharedARSession: ARSession?
 
     // MARK: Lifecycle
 
     override init() {
         super.init()
+        captureSession.delegate = self
         slog("ROOMPLAN", "RoomScanController init — supported=\(Self.isDeviceSupported)")
     }
 
     deinit {
         if isScanning {
-            captureSession?.stop(pauseARSession: false)
+            captureSession.stop(pauseARSession: true)
         }
         slog("ROOMPLAN", "RoomScanController deinit")
     }
 
     // MARK: Public API
 
-    /// Start the scan. Pass the same ARSession used by ARWallpaperView so
-    /// wallpaper rendering and room scanning share one camera feed.
-    /// On iOS 17+, RoomCaptureSession accepts an ARSession at init.
-    func startScan(arSession: ARSession) {
+    /// Start the scan. The caller MUST have already pointed its ARSCNView's
+    /// session to `controller.arSession` BEFORE calling this — otherwise the
+    /// camera feed will go black during scan.
+    func startScan() {
         guard !isScanning else {
             slog("ROOMPLAN", "startScan called but already scanning — ignoring")
             return
@@ -149,33 +146,25 @@ final class RoomScanController: NSObject {
             return
         }
 
-        slog("ROOMPLAN", "startScan — creating RoomCaptureSession with shared ARSession")
-        self.sharedARSession = arSession
+        slog("ROOMPLAN", "startScan — RoomPlan owns its own ARSession")
         surfaceExclusionOverrides.removeAll()
         objectExclusionOverrides.removeAll()
         latestSnapshot = nil
-
-        // iOS 17: pass ARSession at init time.
-        let session = RoomCaptureSession(arSession: arSession)
-        session.delegate = self
-        captureSession = session
-
         isScanning = true
-        session.run(configuration: captureConfig)
+
+        captureSession.run(configuration: captureConfig)
         delegate?.roomScanDidStart(self)
     }
 
-    /// Stop the scan. The final snapshot is delivered via
-    /// `roomScan(_:didFinishWith:)` after RoomBuilder finishes async post-processing.
-    /// We pass pauseARSession: false so ARWallpaperView's ARSession keeps running.
+    /// Stop the scan. Pass pauseARSession: false so the underlying ARSession
+    /// keeps running — the caller's ARSCNView can keep rendering camera feed
+    /// even after RoomPlan stops detecting.
     func stopScan() {
         guard isScanning else { return }
         slog("ROOMPLAN", "stopScan requested")
-        captureSession?.stop(pauseARSession: false)
-        // isScanning flips false in didEndWith delegate callback
+        captureSession.stop(pauseARSession: false)
     }
 
-    /// User tapped a surface to toggle its exclusion.
     func toggleSurfaceExclusion(id: UUID) {
         let current = surfaceExclusionOverrides[id]
             ?? defaultExclusionForSurface(id: id)
@@ -184,7 +173,6 @@ final class RoomScanController: NSObject {
         emitSnapshotIfAvailable(isFinal: latestSnapshot?.isFinal ?? false)
     }
 
-    /// User tapped a furniture object to toggle exclusion.
     func toggleObjectExclusion(id: UUID) {
         let current = objectExclusionOverrides[id] ?? true
         objectExclusionOverrides[id] = !current
@@ -202,8 +190,6 @@ final class RoomScanController: NSObject {
         return surf.kind != .wall
     }
 
-    /// Build a snapshot directly from a CapturedRoom (used in both live updates
-    /// and final results).
     private func buildSnapshot(from room: CapturedRoom,
                                isFinal: Bool) -> ScanSnapshot {
         var surfaces: [DetectedSurface] = []
@@ -294,8 +280,6 @@ final class RoomScanController: NSObject {
 @available(iOS 17.0, *)
 extension RoomScanController: RoomCaptureSessionDelegate {
 
-    /// Live progress updates. RoomPlan gives us a CapturedRoom directly
-    /// (no need to call RoomBuilder for live progress).
     func captureSession(_ session: RoomCaptureSession,
                         didUpdate room: CapturedRoom) {
         let snap = buildSnapshot(from: room, isFinal: false)
@@ -303,8 +287,6 @@ extension RoomScanController: RoomCaptureSessionDelegate {
         delegate?.roomScan(self, didUpdate: snap)
     }
 
-    /// Called when the session ends. The CapturedRoomData here is raw —
-    /// we use RoomBuilder to async-process it into a final CapturedRoom.
     func captureSession(_ session: RoomCaptureSession,
                         didEndWith data: CapturedRoomData,
                         error: Error?) {

@@ -31,7 +31,7 @@ workflows:
           target = project.targets.find { |t| t.name == 'Runner' }
           group = project.main_group['Runner']
           files = [
-            'ARWallpaperView.swift',
+            'WallpaperARView.swift',
             'ARWallpaperViewFactory.swift',
             'TextureCache.swift',
             'WallpaperCutTool.swift',

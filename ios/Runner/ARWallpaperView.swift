@@ -406,8 +406,23 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
                                         details: nil))
                     return
                 }
-                slog("AR-SWIFT", "startScan invoked — passing shared ARSession to RoomScanController")
-                roomScanController.startScan(arSession: arView.session)
+                slog("AR-SWIFT", "startScan invoked — handing ARSCNView over to RoomPlan's ARSession")
+
+                // CRITICAL: Pause our current ARSession before swapping.
+                // Without this, our ARWorldTrackingConfiguration keeps running
+                // and conflicts with RoomPlan.
+                arView.session.pause()
+                slog("AR-SWIFT", "paused wallpaper ARSession; swapping to RoomPlan's ARSession")
+
+                // Adopt RoomPlan's ARSession. ARSCNView.session is assignable —
+                // this is the canonical Apple pattern (WWDC22 RoomPlan session).
+                let controller = roomScanController
+                arView.session = controller.arSession
+                arView.session.delegate = self  // we still want delegate callbacks for rendering
+
+                // Now start the scan. RoomPlan runs its own configuration on
+                // the session it owns. No conflict.
+                controller.startScan()
                 result(nil)
             } else {
                 result(FlutterError(code: "OS_UNSUPPORTED",
@@ -418,7 +433,11 @@ final class ARWallpaperView: NSObject, FlutterPlatformView,
 
         case "stopScan":
             if #available(iOS 17.0, *) {
-                slog("AR-SWIFT", "stopScan invoked")
+                slog("AR-SWIFT", "stopScan invoked — RoomPlan will keep ARSession alive (pauseARSession: false)")
+                // RoomScanController calls stop(pauseARSession: false) internally.
+                // ARSCNView keeps rendering using RoomPlan's ARSession.
+                // When we later need to apply wallpaper, Patch 3 will run our
+                // own ARWorldTrackingConfiguration on the same session.
                 roomScanController.stopScan()
                 result(nil)
             } else {

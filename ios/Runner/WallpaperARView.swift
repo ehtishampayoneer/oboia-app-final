@@ -1,7 +1,7 @@
 // WallpaperARView.swift
-// OBOIA — Clean AR Wallpaper Viewer
+// OBOIA — Clean AR Wallpaper Viewer with Eraser
 // Replaces ARWallpaperView.swift completely.
-// iOS 17+ LiDAR. Uses RoomScanner for scanning, ARKit planes for fallback.
+// iOS 17+ LiDAR. Uses RoomScanner, EraserTool, MeasurementEngine.
 
 import ARKit
 import SceneKit
@@ -29,16 +29,16 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ── AR State ──────────────────────────────────────────────────
     private var currentMode: ARViewMode = .preview
     private var roomScanner: RoomScanner?
-    private var wallTextureCache = TextureCache()
+    private let textureCache = TextureCache()
+    private let eraserTool = EraserTool()
 
     // Wallpaper nodes
     private var wallNodes: [String: SCNNode] = [:]   // surfaceID → SCNNode
+    private var currentWallIndex: Int = 0
 
-    // Manual wall selection state (fallback)
-    // TODO: Phase 2
-
-    // Cut / eraser stubs — will be replaced by EraserTool later
-    private var eraserTool: (() -> Void)? = nil // placeholder
+    // Gesture tracking
+    private var panGesture: UIPanGestureRecognizer?
+    private var isEraserActive = false
 
     // ── Event Sink ───────────────────────────────────────────────
     private var eventSink: ((Any) -> Void)?
@@ -51,12 +51,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         self.sceneView = ARSCNView(frame: frame)
         self.messenger = messenger
 
-        // Method channel
         self.channel = FlutterMethodChannel(
             name: "com.oboia/ar",
             binaryMessenger: messenger
         )
-        // Event channel
         self.eventChannel = FlutterEventChannel(
             name: "com.oboia/ar_events",
             binaryMessenger: messenger
@@ -70,8 +68,14 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         sceneView.automaticallyUpdatesLighting = true
         sceneView.autoenablesDefaultLighting = true
 
-        // Show feature points for LiDAR magic (will be disabled in preview mode)
+        // Show LiDAR points during scan
         sceneView.debugOptions = [.showFeaturePoints]
+
+        // Register eraser gesture (pan)
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        pan.maximumNumberOfTouches = 1
+        sceneView.addGestureRecognizer(pan)
+        self.panGesture = pan
 
         // Method call handler
         channel.setMethodCallHandler { [weak self] (call, result) in
@@ -113,10 +117,24 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             lockWall(call, result: result)
         case "getWallMeasurements":
             getWallMeasurements(call, result: result)
-        // Cut mode stubs (will be implemented with EraserTool later)
-        case "enterCutMode", "exitCutMode", "smartCut", "rectangleCut",
-             "freehandCut", "circleCut", "undoCut", "clearAllCuts":
-            result(nil) // no-op for now
+        case "enterCutMode":
+            enterCutMode(call, result: result)
+        case "exitCutMode":
+            exitCutMode(result: result)
+        case "setBrushSize":
+            setBrushSize(call, result: result)
+        case "setBrushColor":
+            setBrushColor(call, result: result)
+        case "undoCut":
+            eraserTool.undoStroke()
+            result(nil)
+        case "clearAllCuts":
+            eraserTool.resetMask()
+            applyMaskToCurrentWall()
+            result(nil)
+        // Obsolete cut methods – no-op
+        case "smartCut", "rectangleCut", "freehandCut", "circleCut":
+            result(nil)
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -125,7 +143,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     // ──────────────── INIT / DISPOSE ─────────────────────────────
 
     private func initAR(result: @escaping FlutterResult) {
-        // Boot the AR session with a standard configuration
         let configuration = ARWorldTrackingConfiguration()
         configuration.planeDetection = [.vertical]
         sceneView.session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
@@ -149,14 +166,12 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
         switch newMode {
         case .scanning:
-            // Disable plane detection during scan
             sceneView.debugOptions = [.showFeaturePoints]
             let config = ARWorldTrackingConfiguration()
-            config.planeDetection = []   // no auto-plane
+            config.planeDetection = []
             sceneView.session.run(config, options: [.resetTracking])
         case .preview:
-            // Enable plane detection for fallback walls
-            sceneView.debugOptions = []  // clean view
+            sceneView.debugOptions = []
             let config = ARWorldTrackingConfiguration()
             config.planeDetection = [.vertical]
             sceneView.session.run(config, options: [])
@@ -177,7 +192,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             result(FlutterError(code: "UNSUPPORTED", message: "iOS 17+ required", details: nil))
             return
         }
-        // Ensure we are in scanning mode
         setARMode("scanning") { _ in }
 
         let scanner = RoomScanner(arView: sceneView, messenger: messenger)
@@ -195,7 +209,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             return
         }
         scanner.stop { [weak self] snapshot in
-            // Emit scanComplete with snapshot
             if let snapshot = snapshot,
                let jsonData = try? JSONEncoder().encode(snapshot),
                let jsonString = String(data: jsonData, encoding: .utf8) {
@@ -203,9 +216,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             } else {
                 self?.emit("scanComplete", data: ["snapshot": ""])
             }
-            // Clean up
             self?.roomScanner = nil
-            // Switch to preview mode to view results
             self?.setARMode("preview") { _ in }
         }
         result(nil)
@@ -225,37 +236,42 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         let roughnessUrl = args["roughnessUrl"] as? String
         let aoUrl = args["aoUrl"] as? String
 
-        // Load wallpaper texture (async)
-        wallTextureCache.loadPBRTextures(
+        textureCache.loadPBRTextures(
             albedoURL: albedoUrl,
             normalURL: normalUrl,
             roughnessURL: roughnessUrl,
             aoURL: aoUrl
         ) { [weak self] material in
             guard let self = self else { return }
-            // Find the wall node for this index (using ARKit fallback for now)
+            // Apply material to the wall node
             if let node = self.wallNodes[String(wallIndex)] {
                 node.geometry?.firstMaterial = material
+                self.currentWallIndex = wallIndex
+                // Initialize eraser mask with the wallpaper texture size
+                if let image = material.diffuse.contents as? UIImage {
+                    self.eraserTool.createMask(width: Int(image.size.width), height: Int(image.size.height))
+                } else {
+                    self.eraserTool.createMask(width: 1024, height: 1024) // fallback
+                }
+                self.applyMaskToCurrentWall()
                 self.emit("wallpaperPlaced", data: ["wallIndex": wallIndex, "success": true])
             } else {
-                self.emit("wallpaperPlaced", data: ["wallIndex": wallIndex, "success": false])
+                self.emit("wallpaperPlaced", data: ["wallIndex": wallIndex, "success": false, "message": "Wall not found"])
             }
             result(nil)
         }
     }
 
     private func switchWallpaper(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        // Reuse placeWallpaper logic
         placeWallpaper(call, result: result)
     }
 
     private func selectWall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        // Placeholder: highlight the selected wall
         guard let wallIndex = (call.arguments as? [String: Any])?["wallIndex"] as? Int else {
             result(FlutterError(code: "INVALID_ARG", message: "wallIndex required", details: nil))
             return
         }
-        // Emit event (UI will reflect selection)
+        currentWallIndex = wallIndex
         emit("wallSelected", data: ["wallIndex": wallIndex])
         result(nil)
     }
@@ -284,17 +300,72 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
     }
 
     private func getWallMeasurements(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-        // For now return dummy data; later will come from captured room surfaces
         guard let wallIndex = (call.arguments as? [String: Any])?["wallIndex"] as? Int else {
             result(FlutterError(code: "INVALID_ARG", message: "wallIndex required", details: nil))
             return
         }
-        // TODO: use room scanner's last snapshot to get dimensions
+        // Use MeasurementEngine if you have scan snapshot, else fallback
+        // For now, return dummy (you'll get real data from scan snapshot via Dart later)
         result([
             "width": 0.0,
             "height": 0.0,
             "sqm": 0.0
         ])
+    }
+
+    // ──────────────── ERASER MODE ────────────────────────────────
+
+    private func enterCutMode(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        isEraserActive = true
+        // Disable AR gestures while erasing? Not strictly necessary for pan
+        result(nil)
+    }
+
+    private func exitCutMode(result: @escaping FlutterResult) {
+        isEraserActive = false
+        result(nil)
+    }
+
+    private func setBrushSize(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        if let size = (call.arguments as? [String: Any])?["size"] as? CGFloat {
+            eraserTool.brushSize = size
+        }
+        result(nil)
+    }
+
+    private func setBrushColor(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        if let colorHex = (call.arguments as? [String: Any])?["color"] as? String {
+            eraserTool.brushColor = UIColor(hex: colorHex) ?? .white
+        }
+        result(nil)
+    }
+
+    // ──────────────── GESTURE HANDLING ───────────────────────────
+
+    @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
+        guard isEraserActive else { return }
+        let location = gesture.location(in: sceneView)
+
+        switch gesture.state {
+        case .began:
+            eraserTool.startStroke(at: location)
+        case .changed:
+            eraserTool.continueStroke(at: location)
+            applyMaskToCurrentWall()
+        case .ended, .cancelled:
+            eraserTool.endStroke()
+            applyMaskToCurrentWall()
+            // Emit updated cut count (just for UI sync)
+            emit("cutUpdate", data: ["wallIndex": currentWallIndex])
+        default:
+            break
+        }
+    }
+
+    private func applyMaskToCurrentWall() {
+        guard let node = wallNodes[String(currentWallIndex)],
+              let material = node.geometry?.firstMaterial else { return }
+        eraserTool.applyMask(to: material)
     }
 
     // ──────────────── HELPERS ────────────────────────────────────
@@ -308,11 +379,10 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
 extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        // Not used currently
+        // Not used
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
-        // Auto-wallpaper on detected vertical planes (legacy mode)
         guard currentMode == .legacy || currentMode == .preview,
               let planeAnchor = anchor as? ARPlaneAnchor,
               planeAnchor.alignment == .vertical else { return }
@@ -325,7 +395,7 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
 
         let planeNode = SCNNode(geometry: plane)
         planeNode.position = SCNVector3(planeAnchor.center.x, planeAnchor.center.y, planeAnchor.center.z)
-        planeNode.eulerAngles = SCNVector3(-Float.pi/2, 0, 0) // rotate to vertical
+        planeNode.eulerAngles = SCNVector3(-Float.pi/2, 0, 0)
         node.addChildNode(planeNode)
 
         let wallId = planeAnchor.identifier.uuidString
@@ -334,6 +404,35 @@ extension WallpaperARView: ARSCNViewDelegate, ARSessionDelegate {
     }
 
     func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
-        // Update plane geometry if needed
+        // No update needed for planes in this simplified version
+    }
+}
+
+// MARK: - UIColor Hex Helper
+
+extension UIColor {
+    convenience init?(hex: String) {
+        let r, g, b, a: CGFloat
+        let start = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
+        let hexColor = start
+        let scanner = Scanner(string: hexColor)
+        var hexNumber: UInt64 = 0
+        guard scanner.scanHexInt64(&hexNumber) else { return nil }
+
+        switch hexColor.count {
+        case 8: // ARGB
+            a = CGFloat((hexNumber & 0xff000000) >> 24) / 255
+            r = CGFloat((hexNumber & 0x00ff0000) >> 16) / 255
+            g = CGFloat((hexNumber & 0x0000ff00) >> 8) / 255
+            b = CGFloat(hexNumber & 0x000000ff) / 255
+        case 6: // RGB
+            a = 1.0
+            r = CGFloat((hexNumber & 0xff0000) >> 16) / 255
+            g = CGFloat((hexNumber & 0x00ff00) >> 8) / 255
+            b = CGFloat(hexNumber & 0x0000ff) / 255
+        default:
+            return nil
+        }
+        self.init(red: r, green: g, blue: b, alpha: a)
     }
 }

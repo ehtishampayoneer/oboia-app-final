@@ -1,11 +1,13 @@
 // lib/screens/ar/ar_screen.dart
 // OBOIA — Main AR Screen with Scan + Wallpaper + Eraser
+// Adjusted to accept the calling convention used in main.dart
 
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../../services/ar_service.dart';
 import '../../models/wallpaper_model.dart';
+import '../../models/shop_model.dart';
 import 'scan_screen.dart';
 
 const Color goldColor = Color(0xFFFFD369);
@@ -14,11 +16,16 @@ class ARScreen extends StatefulWidget {
   final WallpaperModel wallpaper;
   final double pricePerRoll;
 
-  const ARScreen({
+  // Accept the old parameter names for backward compatibility.
+  // `initialWallpaper` is required – the caller (main.dart) always provides it.
+  ARScreen({
     super.key,
-    required this.wallpaper,
-    required this.pricePerRoll,
-  });
+    WallpaperModel? initialWallpaper,
+    ShopModel? initialShop,
+    double? pricePerRoll,
+  }) : assert(initialWallpaper != null, 'A wallpaper must be provided'),
+       wallpaper = initialWallpaper!,
+       pricePerRoll = pricePerRoll ?? 0.0;
 
   @override
   State<ARScreen> createState() => _ARScreenState();

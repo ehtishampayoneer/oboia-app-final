@@ -232,27 +232,66 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             return
         }
 
-        let normalUrl = args["normalUrl"] as? String
-        let roughnessUrl = args["roughnessUrl"] as? String
-        let aoUrl = args["aoUrl"] as? String
+        let normalUrl = args["normalUrl"] as? String ?? ""
+        let roughnessUrl = args["roughnessUrl"] as? String ?? ""
+        let aoUrl = args["aoUrl"] as? String ?? ""
 
-        textureCache.loadPBRTextures(
-            albedoURL: albedoUrl,
-            normalURL: normalUrl,
-            roughnessURL: roughnessUrl,
-            aoURL: aoUrl
-        ) { [weak self] material in
-            guard let self = self else { return }
-            // Apply material to the wall node
+        // Load textures using the existing TextureCache API
+        let group = DispatchGroup()
+        var albedoImage: UIImage?
+        var normalImage: UIImage?
+        var roughnessImage: UIImage?
+        var aoImage: UIImage?
+
+        group.enter()
+        textureCache.loadImage(from: albedoUrl) {
+            albedoImage = $0
+            group.leave()
+        }
+
+        group.enter()
+        textureCache.loadImage(from: normalUrl) {
+            normalImage = $0
+            group.leave()
+        }
+
+        group.enter()
+        textureCache.loadImage(from: roughnessUrl) {
+            roughnessImage = $0
+            group.leave()
+        }
+
+        group.enter()
+        textureCache.loadImage(from: aoUrl) {
+            aoImage = $0
+            group.leave()
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            guard let self = self, let albedo = albedoImage else {
+                self?.emit("wallpaperPlaced", data: ["wallIndex": wallIndex, "success": false, "message": "Failed to load textures"])
+                result(nil)
+                return
+            }
+
+            let material = SCNMaterial()
+            material.diffuse.contents = albedo
+            if let normal = normalImage {
+                material.normal.contents = normal
+                material.normal.intensity = 1.0
+            }
+            if let roughness = roughnessImage {
+                material.roughness.contents = roughness
+            }
+            if let ao = aoImage {
+                material.ambientOcclusion.contents = ao
+            }
+            material.locksAmbientWithDiffuse = true
+
             if let node = self.wallNodes[String(wallIndex)] {
                 node.geometry?.firstMaterial = material
                 self.currentWallIndex = wallIndex
-                // Initialize eraser mask with the wallpaper texture size
-                if let image = material.diffuse.contents as? UIImage {
-                    self.eraserTool.createMask(width: Int(image.size.width), height: Int(image.size.height))
-                } else {
-                    self.eraserTool.createMask(width: 1024, height: 1024) // fallback
-                }
+                self.eraserTool.createMask(width: Int(albedo.size.width), height: Int(albedo.size.height))
                 self.applyMaskToCurrentWall()
                 self.emit("wallpaperPlaced", data: ["wallIndex": wallIndex, "success": true])
             } else {
@@ -304,8 +343,7 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
             result(FlutterError(code: "INVALID_ARG", message: "wallIndex required", details: nil))
             return
         }
-        // Use MeasurementEngine if you have scan snapshot, else fallback
-        // For now, return dummy (you'll get real data from scan snapshot via Dart later)
+        // TODO: use scan snapshot for real dimensions
         result([
             "width": 0.0,
             "height": 0.0,
@@ -317,7 +355,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
 
     private func enterCutMode(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         isEraserActive = true
-        // Disable AR gestures while erasing? Not strictly necessary for pan
         result(nil)
     }
 
@@ -355,7 +392,6 @@ final class WallpaperARView: NSObject, FlutterPlatformView {
         case .ended, .cancelled:
             eraserTool.endStroke()
             applyMaskToCurrentWall()
-            // Emit updated cut count (just for UI sync)
             emit("cutUpdate", data: ["wallIndex": currentWallIndex])
         default:
             break

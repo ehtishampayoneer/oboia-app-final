@@ -34,8 +34,8 @@ workflows:
             'WallpaperARView.swift',
             'ARWallpaperViewFactory.swift',
             'TextureCache.swift',
-            'WallpaperCutTool.swift',
-            'CutModeOverlay.swift',
+            'EraserTool.swift',
+            'MeasurementEngine.swift',
             'ManualWallSelector.swift',
             'RoomScanner.swift'
           ]

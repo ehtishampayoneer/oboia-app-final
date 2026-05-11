@@ -1,16 +1,13 @@
 // RoomScanner.swift
 // OBOIA - Complete LiDAR RoomPlan Scanner
-// Replaces RoomScanController.swift. iOS 17+ LiDAR required.
 
 import RoomPlan
 import ARKit
 import SceneKit
 
-// MARK: - Data Models for Flutter Events
-
 struct DetectedSurface: Codable {
     let id: String
-    let type: String       // "wall", "door", "window", "opening"
+    let type: String
     let width: Float
     let height: Float
     let area: Float
@@ -24,31 +21,25 @@ struct ScanSnapshot: Codable {
 
 struct DetectedObject: Codable {
     let id: String
-    let type: String       // "furniture", "unknown"
+    let type: String
     var excluded: Bool = false
 }
 
-// MARK: - RoomScanner Class
-
 @available(iOS 17.0, *)
-final class RoomScanner: NSObject, ObservableObject {
+final class RoomScanner: NSObject {
 
-    // Dependencies
     private weak var arView: ARSCNView?
     private var messenger: FlutterBinaryMessenger?
     private var eventSink: ((Any) -> Void)?
 
-    // RoomPlan
     private var captureSession: RoomCaptureSession?
     private var roomBuilder: RoomBuilder?
 
-    // State
     private var isScanning = false
     private let lock = NSLock()
     private var lastUpdateTime: TimeInterval = 0
-    private let updateDebounce: TimeInterval = 0.5 // 500ms debounce
+    private let updateDebounce: TimeInterval = 0.5
 
-    // Latest processed snapshot
     private var currentSurfaces: [DetectedSurface] = []
     private var currentObjects: [DetectedObject] = []
 
@@ -62,36 +53,27 @@ final class RoomScanner: NSObject, ObservableObject {
         eventSink = sink
     }
 
-    // MARK: - Start / Stop
-
     func start() {
         guard isScanning == false else { return }
 
         isScanning = true
 
-        // Create a fresh RoomCaptureSession (no args → uses new ARSession)
         let session = RoomCaptureSession()
 
-        // Configure for best results
         var config = RoomCaptureSession.Configuration()
-        config.isTextured = true
+        config.textured = true
         config.isCoachingEnabled = true
         session.run(configuration: config)
 
-        // Attach to the shared ARSCNView for rendering
         if let arView = arView {
             arView.session = session.arSession
             arView.session.delegate = self
             arView.automaticallyUpdatesLighting = true
-
-            // Ensure we render the point cloud and mesh
-            arView.debugOptions = [.showFeaturePoints] // shows LiDAR points
+            arView.debugOptions = [.showFeaturePoints]
         }
 
-        // Set delegates
         session.delegate = self
 
-        // Create builder for final model later
         roomBuilder = RoomBuilder(options: [])
 
         self.captureSession = session
@@ -112,18 +94,14 @@ final class RoomScanner: NSObject, ObservableObject {
         session.stop()
         roomBuilder = nil
 
-        // Return the final snapshot immediately (already built during scan)
         let final = ScanSnapshot(surfaces: currentSurfaces, objects: currentObjects)
         completion(final)
 
-        // Clean up
         self.captureSession = nil
         if let arView = arView {
             arView.session.delegate = nil
         }
     }
-
-    // MARK: - Exclusion Toggle
 
     func toggleSurfaceExclusion(id: String) -> Bool? {
         guard let idx = currentSurfaces.firstIndex(where: { $0.id == id }) else { return nil }
@@ -139,13 +117,10 @@ final class RoomScanner: NSObject, ObservableObject {
         return currentObjects[idx].excluded
     }
 
-    // MARK: - Private: Process CapturedRoom into stable snapshot
-
     private func processRoom(_ capturedRoom: CapturedRoom) {
         var surfaces: [DetectedSurface] = []
         var objects: [DetectedObject] = []
 
-        // Walls
         for wall in capturedRoom.walls {
             let id = wall.identifier.uuidString
             let w = wall.dimensions.x
@@ -153,7 +128,6 @@ final class RoomScanner: NSObject, ObservableObject {
             surfaces.append(DetectedSurface(id: id, type: "wall", width: w, height: h, area: w * h))
         }
 
-        // Doors
         for door in capturedRoom.doors {
             let id = door.identifier.uuidString
             let w = door.dimensions.x
@@ -161,7 +135,6 @@ final class RoomScanner: NSObject, ObservableObject {
             surfaces.append(DetectedSurface(id: id, type: "door", width: w, height: h, area: w * h))
         }
 
-        // Windows
         for window in capturedRoom.windows {
             let id = window.identifier.uuidString
             let w = window.dimensions.x
@@ -169,7 +142,6 @@ final class RoomScanner: NSObject, ObservableObject {
             surfaces.append(DetectedSurface(id: id, type: "window", width: w, height: h, area: w * h))
         }
 
-        // Openings
         for opening in capturedRoom.openings {
             let id = opening.identifier.uuidString
             let w = opening.dimensions.x
@@ -177,7 +149,6 @@ final class RoomScanner: NSObject, ObservableObject {
             surfaces.append(DetectedSurface(id: id, type: "opening", width: w, height: h, area: w * h))
         }
 
-        // Objects (furniture)
         for obj in capturedRoom.objects {
             let id = obj.identifier.uuidString
             objects.append(DetectedObject(id: id, type: obj.category == .storage ? "furniture" : "unknown"))
@@ -200,12 +171,9 @@ final class RoomScanner: NSObject, ObservableObject {
     }
 }
 
-// MARK: - RoomCaptureSessionDelegate
-
 @available(iOS 17.0, *)
 extension RoomScanner: RoomCaptureSessionDelegate {
     func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
-        // Debounce: only process every 0.5s to avoid thrashing
         let now = CACurrentMediaTime()
         guard now - lastUpdateTime > updateDebounce else { return }
         lastUpdateTime = now
@@ -233,7 +201,6 @@ extension RoomScanner: RoomCaptureSessionDelegate {
         if let error = error {
             eventSink?(["type": "scanFailed", "data": ["message": error.localizedDescription]])
         } else {
-            // Final stable model will be delivered on stop()
             eventSink?(["type": "scanComplete", "data": "ok"])
         }
     }
@@ -243,15 +210,8 @@ extension RoomScanner: RoomCaptureSessionDelegate {
     }
 }
 
-// MARK: - ARSessionDelegate (for rendering only)
-
 @available(iOS 17.0, *)
 extension RoomScanner: ARSessionDelegate {
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        // LiDAR point cloud automatically visible via debugOptions
-    }
-
-    func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
-        // Not used
-    }
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {}
+    func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {}
 }
